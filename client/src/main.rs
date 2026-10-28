@@ -15,6 +15,7 @@ mod panel;
 mod plumber;
 mod settings;
 mod shaper;
+mod touch;
 mod sleep;
 mod ui;
 

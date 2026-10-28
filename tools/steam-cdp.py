@@ -60,6 +60,8 @@ def add_shortcut(name, exe, start_dir):
       SteamClient.Apps.SetShortcutName(id, {json.dumps(name)});
       SteamClient.Apps.SetShortcutExe(id, {q(exe)});
       SteamClient.Apps.SetShortcutStartDir(id, {q(start_dir)});
+      // render at the panel's native size; Steam's default is 1280x720, upscaled and blurry
+      SteamClient.Apps.SetAppResolutionOverride(id, "Native");
       return id;
     }})()"""
     return evaluate(js)

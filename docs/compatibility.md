@@ -59,9 +59,12 @@
 | 蓝牙音频（A2DP） | 自动 | ✅ aptX HD，按设置输出到扬声器或耳机 |
 | 多台蓝牙主机切换 | 自动（一台真实主机 + 一个虚构地址） | ✅ 拦截与解除生效；未用第二台真实设备测试 |
 | Wi-Fi ↔ 蓝牙热切换 | 自动 | ✅ |
-| 触控面板的点击与手势 | 手动 | 部分完成；仍在打磨 |
+| 触控面板的点击与手势 | 自动（虚拟触摸屏注入）+ 手动 | ✅ 直接读触摸屏：单指移动、双指滚动、拖动后按钮仍可点 |
 
 ## 已知限制
+
+- gamescope 把触摸转成单个模拟鼠标，没有多点信息，双指操作后还可能卡在“按下”状态。所以客户端直接读取触摸屏（`/dev/input` 中带 `INPUT_PROP_DIRECT` 的多点设备，deck 用户可读、未被独占）。第一次触摸时用模拟鼠标的位置校准屏幕方向，结果保存在 `~/.config/flipad/touch-orientation`。
+- Steam 默认让非 Steam 游戏以 1280×720 渲染再放大。部署工具会把 Flip Pad 的分辨率设成“原生”（`SetAppResolutionOverride(…, "Native")`）。
 
 - 蓝牙模式没有耳机麦克风：HFP 依赖内核的 RFCOMM，而 Pocknix 内核没有开启 `CONFIG_BT_RFCOMM`（BlueZ 报 `RFCOMM server failed for Hands-Free unit: Protocol not supported`）。需要麦克风请用 Wi-Fi 模式。如果你的系统内核支持 RFCOMM，在 WirePlumber 里开启 `hfp_hf` 角色即可；电脑在有程序录音时会自动切到 HFP。
 - 蓝牙模式没有主机状态和插件面板。

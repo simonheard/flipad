@@ -29,15 +29,30 @@ const SCROLL_PER_PX: f32 = 3.0;
 /// A touch sequence on the touchpad or the scroll strip.
 struct Gesture {
     strip: bool,
-    /// Finger id → last position (design units).
-    fingers: Vec<(u64, f32, f32)>,
+    source: Source,
+    /// Finger id → last position (design units); None until its first move,
+    /// because an emulated pointer may report the press before it warps.
+    fingers: Vec<(u64, Option<(f32, f32)>)>,
     max_fingers: usize,
     start: Instant,
+    last_event: Instant,
     travel: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// gamescope's emulated pointer (one "finger").
+    Mouse,
+    /// Touch events from the window system.
+    Touch,
+    /// The touchscreen read directly (see touch.rs): real multi-touch.
+    Raw,
 }
 
 /// Mouse events stand in for touch when the compositor only sends a pointer.
 const MOUSE_FINGER: u64 = u64::MAX;
+/// A single step longer than this (design px) is a pointer warp, not motion.
+const JUMP: f32 = 160.0;
 
 pub struct App {
     shared: Arc<Shared>,
@@ -51,6 +66,12 @@ pub struct App {
     cursor: (f64, f64),
     gesture: Option<Gesture>,
     drag_lock: bool,
+    /// Direct touchscreen frames, the panel's learned orientation, and the
+    /// last frame seen (for learning it and for diffing contacts).
+    touch: Option<crate::touch::Frames>,
+    orientation: Option<crate::touch::Orientation>,
+    raw_prev: Vec<crate::touch::Contact>,
+    raw_prev_at: Instant,
     switcher: bool,
     last_touch: Option<Instant>,
     dirty: bool,
@@ -74,6 +95,10 @@ impl App {
             cursor: (0.0, 0.0),
             gesture: None,
             drag_lock: false,
+            touch: None,
+            orientation: if std::env::var_os("FLIPAD_TOUCH_NAME").is_some() { None } else { load_orientation() },
+            raw_prev: Vec::new(),
+            raw_prev_at: Instant::now(),
             switcher: false,
             last_touch: None,
             dirty: true,
@@ -105,42 +130,77 @@ impl App {
         self.shared.pointer(PointerOp::Buttons(base));
     }
 
-    /// A finger (or the mouse) went down.
+    fn hit_at(&self, x: f32, y: f32) -> Option<Hit> {
+        self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|h| h.1)
+    }
+
+    /// Direct touchscreen reading is set up and knows which way is up. Then
+    /// every touch is handled from it, and gamescope's emulated pointer (which
+    /// can get stuck "pressed" after two-finger touches) is only used to check
+    /// the orientation.
+    fn raw_ready(&self) -> bool {
+        self.touch.is_some() && self.orientation.is_some()
+    }
+
+    /// A finger (or the emulated mouse) went down.
     fn touch_down(&mut self, el: &ActiveEventLoop, id: u64, x: f64, y: f64) {
         let (dx, dy) = self.design(x, y);
-        if let Some(g) = &mut self.gesture {
-            if !g.strip && !g.fingers.iter().any(|f| f.0 == id) {
-                g.fingers.push((id, dx, dy));
-                g.max_fingers = g.max_fingers.max(g.fingers.len());
-                self.dirty = true;
-            }
+        let source = if id == MOUSE_FINGER { Source::Mouse } else { Source::Touch };
+        let hit = self.hit_at(dx, dy);
+        let on_pad = matches!(hit, Some(Hit::Pad) | Some(Hit::ScrollStrip));
+        // the touchpad itself is read from the panel directly when possible
+        if on_pad && self.raw_ready() && source == Source::Mouse {
             return;
         }
-        let hit = self.hits.iter().rev().find(|(r, _)| r.contains(dx, dy)).map(|h| h.1);
+        if let Some(g) = &mut self.gesture {
+            let stale = g.last_event.elapsed() > Duration::from_secs(2);
+            if g.source == source && !stale && source == Source::Touch {
+                if !g.strip && !g.fingers.iter().any(|f| f.0 == id) {
+                    g.fingers.push((id, Some((dx, dy))));
+                    g.max_fingers = g.max_fingers.max(g.fingers.len());
+                    self.dirty = true;
+                }
+                return;
+            }
+            if g.source != Source::Raw || stale {
+                // a press without the previous release: drop the old gesture
+                self.gesture = None;
+            } else if !on_pad {
+                return;
+            }
+        }
         match hit {
             Some(Hit::Pad) | Some(Hit::ScrollStrip) => {
-                self.gesture = Some(Gesture {
-                    strip: hit == Some(Hit::ScrollStrip),
-                    fingers: vec![(id, dx, dy)],
-                    max_fingers: 1,
-                    start: Instant::now(),
-                    travel: 0.0,
-                });
-                self.dirty = true;
+                let pos = if source == Source::Mouse { None } else { Some((dx, dy)) };
+                self.begin_gesture(hit == Some(Hit::ScrollStrip), source, id, pos);
             }
             Some(h) => self.tap(el, h),
             None => {}
         }
     }
 
+    fn begin_gesture(&mut self, strip: bool, source: Source, id: u64, pos: Option<(f32, f32)>) {
+        let now = Instant::now();
+        self.gesture =
+            Some(Gesture { strip, source, fingers: vec![(id, pos)], max_fingers: 1, start: now, last_event: now, travel: 0.0 });
+        self.dirty = true;
+    }
+
     fn touch_move(&mut self, id: u64, x: f64, y: f64) {
-        let (nx, ny) = self.design(x, y);
+        let p = self.design(x, y);
+        self.gesture_move(id, p);
+    }
+
+    fn gesture_move(&mut self, id: u64, (nx, ny): (f32, f32)) {
         let Some(g) = &mut self.gesture else { return };
         let n = g.fingers.len() as f32;
         let Some(f) = g.fingers.iter_mut().find(|f| f.0 == id) else { return };
-        let (ddx, ddy) = (nx - f.1, ny - f.2);
-        f.1 = nx;
-        f.2 = ny;
+        g.last_event = Instant::now();
+        let Some((ox, oy)) = f.1.replace((nx, ny)) else { return };
+        let (ddx, ddy) = (nx - ox, ny - oy);
+        if ddx.hypot(ddy) > JUMP {
+            return; // a warp, not a slide
+        }
         g.travel += ddx.hypot(ddy);
         if g.strip {
             self.shared.pointer(PointerOp::Scroll(-ddy * SCROLL_PER_PX * 1.5, 0.0));
@@ -165,7 +225,78 @@ impl App {
         }
     }
 
+    /// Learns (or corrects) the panel's orientation from an emulated press
+    /// that happened while exactly one finger was on the panel.
+    fn calibrate(&mut self, x: f64, y: f64) {
+        let Some(cv) = &self.canvas else { return };
+        if self.raw_prev.len() != 1 || self.raw_prev_at.elapsed() > Duration::from_millis(300) {
+            return;
+        }
+        let c = self.raw_prev[0];
+        let (sx, sy) = (x as f32 / cv.pm.width() as f32, y as f32 / cv.pm.height() as f32);
+        let (o, dist) = crate::touch::Orientation::best(c.u, c.v, sx, sy);
+        if dist < 0.06 && self.orientation != Some(o) {
+            eprintln!("touch: panel orientation {o:?}");
+            self.orientation = Some(o);
+            if std::env::var_os("FLIPAD_TOUCH_NAME").is_none() {
+                save_orientation(o);
+            }
+        }
+    }
+
+    /// Handles directly-read touchscreen frames: taps on buttons and
+    /// touchpad gestures.
+    fn process_raw(&mut self, el: &ActiveEventLoop) {
+        let Some(frames) = &self.touch else { return };
+        let frames: Vec<Vec<crate::touch::Contact>> = std::mem::take(&mut *frames.lock().unwrap());
+        for frame in frames {
+            if self.raw_ready()
+                && let (Some(o), Some(cv)) = (self.orientation, &self.canvas)
+            {
+                let (w, h) = (cv.pm.width() as f64, cv.pm.height() as f64);
+                let to_design = |c: &crate::touch::Contact| {
+                    let (sx, sy) = o.map(c.u, c.v);
+                    (sx as f64 * w, sy as f64 * h)
+                };
+                let prev: Vec<i32> = self.raw_prev.iter().map(|c| c.id).collect();
+                for c in &frame {
+                    let (x, y) = to_design(c);
+                    let pos = self.design(x, y);
+                    let id = c.id as u64;
+                    if !prev.contains(&c.id) {
+                        match &mut self.gesture {
+                            Some(g) if g.source == Source::Raw && !g.strip => {
+                                g.fingers.push((id, Some(pos)));
+                                g.max_fingers = g.max_fingers.max(g.fingers.len());
+                            }
+                            Some(_) => {}
+                            None => match self.hit_at(pos.0, pos.1) {
+                                Some(hit @ (Hit::Pad | Hit::ScrollStrip)) => {
+                                    self.begin_gesture(hit == Hit::ScrollStrip, Source::Raw, id, Some(pos));
+                                }
+                                Some(hit) if frame.len() == 1 => self.tap(el, hit),
+                                _ => {}
+                            },
+                        }
+                    } else {
+                        self.gesture_move(id, pos);
+                    }
+                }
+                for id in prev.iter().filter(|id| !frame.iter().any(|c| c.id == **id)) {
+                    if self.gesture.as_ref().is_some_and(|g| g.source == Source::Raw) {
+                        self.touch_up(*id as u64);
+                    }
+                }
+            }
+            self.raw_prev = frame;
+            self.raw_prev_at = Instant::now();
+        }
+    }
+
     fn tap(&mut self, el: &ActiveEventLoop, hit: Hit) {
+        if debug_input() {
+            eprintln!("input: tap {hit:?}");
+        }
         self.flash = Some((hit, Instant::now()));
         self.dirty = true;
         let sh = &self.shared;
@@ -176,6 +307,9 @@ impl App {
         };
         match hit {
             Hit::Tab(t) => {
+                if t != Tab::Touchpad {
+                    self.gesture = None;
+                }
                 if t != Tab::Touchpad && self.drag_lock {
                     self.drag_lock = false;
                     sh.pointer(PointerOp::Buttons(0));
@@ -306,16 +440,29 @@ impl ApplicationHandler<()> for App {
         }
         self.window = Some(window);
         self.dirty = true;
+        if self.touch.is_none() {
+            let s = self.shared.clone();
+            self.touch = crate::touch::start(move || (s.notify)());
+        }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
         if self.shared.quit.load(Ordering::Relaxed) {
             el.exit();
         }
+        self.process_raw(el);
         self.dirty = true;
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        if debug_input() {
+            match &event {
+                WindowEvent::Touch(t) => eprintln!("input: touch {:?} id={} at {:.0},{:.0}", t.phase, t.id, t.location.x, t.location.y),
+                WindowEvent::CursorMoved { position, .. } => eprintln!("input: cursor {:.0},{:.0}", position.x, position.y),
+                WindowEvent::MouseInput { state, button, .. } => eprintln!("input: mouse {button:?} {state:?}"),
+                _ => {}
+            }
+        }
         match event {
             WindowEvent::CloseRequested => self.quit(el),
             WindowEvent::RedrawRequested => self.draw(),
@@ -332,15 +479,24 @@ impl ApplicationHandler<()> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                if self.mouse_ok() {
+                if self.mouse_ok() && !self.raw_ready() {
                     self.touch_move(MOUSE_FINGER, position.x, position.y);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if self.mouse_ok() => {
                 let (x, y) = self.cursor;
                 match state {
-                    ElementState::Pressed => self.touch_down(el, MOUSE_FINGER, x, y),
-                    ElementState::Released => self.touch_up(MOUSE_FINGER),
+                    ElementState::Pressed => {
+                        let was_ready = self.raw_ready();
+                        self.process_raw(el);
+                        self.calibrate(x, y);
+                        // once calibrated, the raw reader handles touches itself
+                        if !was_ready {
+                            self.touch_down(el, MOUSE_FINGER, x, y)
+                        }
+                    }
+                    ElementState::Released if !self.raw_ready() => self.touch_up(MOUSE_FINGER),
+                    ElementState::Released => {}
                 }
             }
             _ => {}
@@ -371,6 +527,24 @@ impl ApplicationHandler<()> for App {
             el.set_control_flow(ControlFlow::WaitUntil(next_frame));
         }
     }
+}
+
+fn orientation_file() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/flipad/touch-orientation")
+}
+
+fn load_orientation() -> Option<crate::touch::Orientation> {
+    let s = std::fs::read_to_string(orientation_file()).ok()?;
+    crate::touch::Orientation::ALL.into_iter().find(|o| format!("{o:?}") == s.trim())
+}
+
+fn save_orientation(o: crate::touch::Orientation) {
+    let _ = std::fs::write(orientation_file(), format!("{o:?}"));
+}
+
+fn debug_input() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLIPAD_DEBUG_INPUT").is_some())
 }
 
 fn read_battery() -> (Option<u8>, bool) {
