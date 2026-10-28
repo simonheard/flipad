@@ -592,8 +592,8 @@ fn scene_intro(st: &mut Studio, pm: &mut Pixmap, t: f32) {
     text(st, pm, "Retroid Pocket Flip 2 · 已刷 Linux（Pocknix），不是原厂安卓", W as f32 / 2.0, 205.0, 34.0, ACCENT, b, true, Align::Center);
 }
 
-fn scene_controller(st: &mut Studio, pm: &mut Pixmap, t: f32) {
-    background(pm, t);
+/// Live controller on the overview: sticks circling, buttons, rumble shakes.
+fn controller(st: &mut Studio, pm: &mut Pixmap, t: f32, keys: &[(f32, Pose)], rumble_from: f32) {
     let ang = t * 2.2;
     let mut b = 0;
     if (t * 2.0) as i32 % 3 == 0 {
@@ -614,15 +614,48 @@ fn scene_controller(st: &mut Studio, pm: &mut Pixmap, t: f32) {
         lt: 0,
         rt: (((t * 1.5).sin() * 0.5 + 0.5) * 255.0) as u8,
     };
-    // rumble bursts once the "震动" point is up
-    let rumble = t > 3.6 && (t - 3.6) % 2.0 < 0.5;
+    let rumble = t > rumble_from && (t - rumble_from) % 2.0 < 0.5;
     let v = View { pad, rumble, ..base_view() };
     let key = format!("ctrl{}", (t * FPS) as i32);
     let (scr, _) = st.screen(&key, Tab::Overview, &v, &Settings::default(), |_| {});
-    let keys = [(0.0, HOME), (2.4, HOME), (3.4, close(560.0, 560.0)), (7.2, close(560.0, 560.0)), (8.4, HOME), (10.0, HOME)];
-    shoot(st, pm, t, &scr, &keys, if rumble { 4.0 } else { 0.0 });
+    shoot(st, pm, t, &scr, keys, if rumble { 4.0 } else { 0.0 });
+}
+
+/// Why this exists: moving house, the PS5 is packed, 影之刃零 is out.
+fn scene_story(st: &mut Studio, pm: &mut Pixmap, t: f32) {
+    background(pm, t);
+    let keys = [(0.0, HOME), (3.0, HOME), (4.0, close(560.0, 560.0)), (9.0, close(560.0, 560.0)), (10.4, HOME), (12.0, HOME)];
+    controller(st, pm, t, &keys, 99.0);
+    heading(st, pm, t, "起因", "影之刃零，憋不住了");
+    points(st, pm, t, &[0.4, 2.0, 6.8], &["搬家，PS5 和手柄全打包了", "影之刃零马上解禁", "手边只有一台 Flip 2"]);
+}
+
+/// The handheld runs Linux, not the stock Android: said loud and clear.
+fn scene_linux(st: &mut Studio, pm: &mut Pixmap, t: f32) {
+    background(pm, t);
+    let (scr, _) = st.screen("intro", Tab::Overview, &base_view(), &Settings::default(), |_| {});
+    let hero = Pose { k: 0.8, x: 960.0, y: 520.0 };
+    let keys = [(0.0, HOME), (1.2, hero), (6.6, Pose { k: 0.84, ..hero }), (8.0, HOME)];
+    shoot(st, pm, t, &scr, &keys, 0.0);
+    let out = outro(st, t);
+    let a = fade(t, 1.4, 0.5) * out;
+    text(st, pm, "这台掌机刷的是 Linux", W as f32 / 2.0, 150.0 - (1.0 - a) * 30.0, 72.0, TEXT, a, true, Align::Center);
+    let b = fade(t, 3.4, 0.5) * out;
+    text(st, pm, "Pocknix（Arch Linux ARM）· 不是原厂安卓，安卓版没做", W as f32 / 2.0, 225.0, 36.0, ACCENT, b, true, Align::Center);
+}
+
+/// Xbox controller to the PC; one tap swaps to the Nintendo layout.
+fn scene_layout(st: &mut Studio, pm: &mut Pixmap, t: f32) {
+    background(pm, t);
+    let s = Settings { nintendo: t > 4.7, ..Settings::default() };
+    let (scr, hits) = st.screen(&format!("layout{}", t > 4.7), Tab::Settings, &base_view(), &s, |_| {});
+    let at = hit_at(&hits, Hit::Nintendo(true));
+    let near = close(at.0, at.1);
+    let keys = [(0.0, HOME), (1.2, near), (5.4, near), (6.0, HOME)];
+    let p = shoot(st, pm, t, &scr, &keys, 0.0);
+    tap(pm, p.screen(at), t, 4.6);
     heading(st, pm, t, "WI-FI · 约 2 毫秒", "无线 Xbox 手柄");
-    points(st, pm, t, &[0.8, 3.6, 6.4], &["电脑识别为 Xbox 手柄", "震动回传到掌机", "Xbox / 任天堂布局切换"]);
+    points(st, pm, t, &[1.4, 4.4], &["电脑识别为 Xbox 手柄", "一键换成 Switch 键位"]);
 }
 
 fn scene_touchpad(st: &mut Studio, pm: &mut Pixmap, t: f32) {
@@ -800,16 +833,20 @@ fn scene_end(st: &mut Studio, pm: &mut Pixmap, t: f32) {
     text(st, pm, "产品图片来自 Retroid 官网", W as f32 / 2.0, 1030.0, 24.0, DIM, fade(t, 2.2, 0.6), false, Align::Center);
 }
 
-/// Scene lengths are whole bars at 120 BPM so cuts land on the music.
-const SCENES: [(&str, f32, SceneFn); 8] = [
-    ("01_intro", 6.0, scene_intro),
-    ("02_controller", 10.0, scene_controller),
-    ("03_touchpad", 8.0, scene_touchpad),
-    ("04_shortcuts", 10.0, scene_shortcuts),
-    ("05_headset", 8.0, scene_audio),
-    ("06_plugins", 8.0, scene_plugins),
-    ("07_bluetooth", 6.0, scene_bluetooth),
-    ("08_end", 6.0, scene_end),
+/// (name, length on screen, length the choreography was written for, scene).
+/// Lengths are whole bars at 120 BPM so cuts land on the music; the scene's
+/// clock runs at base/length so a scene can be stretched to fit the voice.
+const SCENES: [(&str, f32, f32, SceneFn); 10] = [
+    ("01_intro", 8.0, 6.0, scene_intro),
+    ("02_story", 12.0, 12.0, scene_story),
+    ("03_linux", 8.0, 8.0, scene_linux),
+    ("04_layout", 6.0, 6.0, scene_layout),
+    ("05_touchpad", 6.0, 8.0, scene_touchpad),
+    ("06_shortcuts", 10.0, 10.0, scene_shortcuts),
+    ("07_headset", 8.0, 8.0, scene_audio),
+    ("08_plugins", 8.0, 8.0, scene_plugins),
+    ("09_bluetooth", 8.0, 6.0, scene_bluetooth),
+    ("10_end", 6.0, 6.0, scene_end),
 ];
 
 /// Renders every scene to `DIR/assets/clips/NN_name.mp4`. With `only`, just
@@ -822,11 +859,11 @@ pub fn make(dir: &str, only: Option<&str>) -> Result<(), String> {
     let mut photo = Pixmap::load_png(&photo_path).map_err(|e| format!("{}: {e}", photo_path.display()))?;
     feather(&mut photo);
     let mut st = Studio { text: Text::load()?, photo, ui_cache: HashMap::new(), prev: None, last: None, dur: 0.0 };
-    for (n, (name, secs, f)) in SCENES.into_iter().enumerate() {
+    for (n, (name, secs, base, f)) in SCENES.into_iter().enumerate() {
         if only.is_some_and(|o| !name.contains(o)) {
             continue;
         }
-        st.dur = secs;
+        st.dur = base;
         let out = clips.join(format!("{name}.mp4"));
         eprintln!("rendering {name} ({secs}s)");
         let mut ff = Command::new("ffmpeg")
@@ -841,7 +878,7 @@ pub fn make(dir: &str, only: Option<&str>) -> Result<(), String> {
         for i in 0..frames {
             let t = i as f32 / FPS;
             let mut pm = Pixmap::new(W, H).unwrap();
-            f(&mut st, &mut pm, t);
+            f(&mut st, &mut pm, t * base / secs);
             // fade from/to black only at the very start and end
             let edge = if n == 0 {
                 (t / 0.4).min(1.0)
