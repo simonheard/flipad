@@ -849,6 +849,56 @@ const SCENES: [(&str, f32, f32, SceneFn); 10] = [
     ("10_end", 6.0, 6.0, scene_end),
 ];
 
+fn chip(st: &mut Studio, pm: &mut Pixmap, s: &str, x: f32, y: f32) -> f32 {
+    let w = st.text.measure(s, 34.0, true) + 52.0;
+    let mut paint = Paint { anti_alias: true, ..Paint::default() };
+    paint.set_color(rgba(ACCENT, 0.16));
+    pm.fill_path(&rrect(x, y, w, 64.0, 32.0), &paint, FillRule::Winding, Transform::identity(), None);
+    paint.set_color(rgba(ACCENT, 0.6));
+    pm.stroke_path(&rrect(x, y, w, 64.0, 32.0), &paint, &Stroke { width: 2.0, ..Stroke::default() }, Transform::identity(), None);
+    text(st, pm, s, x + 26.0, y + 44.0, 34.0, TEXT, 1.0, true, Align::Left);
+    w
+}
+
+/// The video cover: the device turned towards the title.
+fn cover(st: &mut Studio) -> Pixmap {
+    let mut pm = Pixmap::new(W, H).unwrap();
+    background(&mut pm, 0.0);
+    let pad = Pad { buttons: button::SOUTH | button::TR, lx: 20000, ly: -12000, rx: -9000, ry: 6000, lt: 0, rt: 200 };
+    let (scr, _) = st.screen("cover", Tab::Overview, &View { pad, ..base_view() }, &Settings::default(), |_| {});
+    let pose = Pose { k: 1.0, x: 1330.0, y: 420.0 };
+    device(st, &mut pm, Shot { screen: &scr, pose, tilt: (0.1, -0.2), alpha: 1.0, power: 1.0, flash: 0.0, mix: 1.0 });
+    // keep the left side calm for the title
+    if let Some(shader) = tiny_skia::LinearGradient::new(
+        tiny_skia::Point::from_xy(560.0, 0.0),
+        tiny_skia::Point::from_xy(900.0, 0.0),
+        vec![
+            tiny_skia::GradientStop::new(0.0, Color::from_rgba8(9, 10, 14, 230)),
+            tiny_skia::GradientStop::new(1.0, Color::from_rgba8(9, 10, 14, 0)),
+        ],
+        tiny_skia::SpreadMode::Pad,
+        Transform::identity(),
+    ) {
+        let paint = Paint { shader, ..Paint::default() };
+        pm.fill_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 900.0, H as f32).unwrap(), &paint, Transform::identity(), None);
+    }
+    let x = 110.0;
+    text(st, &mut pm, "PS5 打包了，影之刃零憋不住了", x, 250.0, 46.0, ACCENT, 1.0, true, Align::Left);
+    text(st, &mut pm, "掌机秒变", x, 420.0, 132.0, TEXT, 1.0, true, Align::Left);
+    text(st, &mut pm, "电脑手柄", x, 575.0, 132.0, TEXT, 1.0, true, Align::Left);
+    text(st, &mut pm, "Retroid Pocket Flip 2 · 刷 Linux", x, 670.0, 44.0, DIM, 1.0, true, Align::Left);
+    let mut cx = x;
+    for (i, c) in ["Wi-Fi 2ms", "触控板", "耳机 + 麦", "蓝牙", "开源"].iter().enumerate() {
+        let y = if i < 3 { 760.0 } else { 844.0 };
+        if i == 3 {
+            cx = x;
+        }
+        cx += chip(st, &mut pm, c, cx, y) + 16.0;
+    }
+    text(st, &mut pm, "Flip Pad", x, 1010.0, 40.0, TEXT, 0.85, true, Align::Left);
+    pm
+}
+
 /// Renders every scene to `DIR/assets/clips/NN_name.mp4`. With `only`, just
 /// the scenes whose name contains it (their cuts then fade from nothing).
 pub fn make(dir: &str, only: Option<&str>) -> Result<(), String> {
@@ -859,6 +909,12 @@ pub fn make(dir: &str, only: Option<&str>) -> Result<(), String> {
     let mut photo = Pixmap::load_png(&photo_path).map_err(|e| format!("{}: {e}", photo_path.display()))?;
     feather(&mut photo);
     let mut st = Studio { text: Text::load()?, photo, ui_cache: HashMap::new(), prev: None, last: None, dur: 0.0 };
+    if only == Some("cover") {
+        let out = dir.join("renders/cover.png");
+        cover(&mut st).save_png(&out).map_err(|e| e.to_string())?;
+        eprintln!("→ {}", out.display());
+        return Ok(());
+    }
     for (n, (name, secs, base, f)) in SCENES.into_iter().enumerate() {
         if only.is_some_and(|o| !name.contains(o)) {
             continue;
