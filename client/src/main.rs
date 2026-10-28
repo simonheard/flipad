@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use evdev::raw_stream::RawDevice;
 use flipad_proto::{PORT, parse_token};
 use link::{Phase, Shared, View};
+use settings::Mode;
 use winit::event_loop::EventLoop;
 
 fn config_dir() -> PathBuf {
@@ -50,6 +51,14 @@ fn wifi_power_save(on: bool) {
         .args(["-n", "iw", "dev", "wlan0", "set", "power_save", if on { "on" } else { "off" }])
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+/// False once the borrowed controller node has gone away.
+fn controller_alive(dev: &RawDevice) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd { fd: dev.as_raw_fd(), events: 0, revents: 0 };
+    unsafe { libc::poll(&mut pfd, 1, 0) };
+    pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0
 }
 
 fn main() {
@@ -103,18 +112,43 @@ fn main() {
         unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) }
     };
     let shared = Arc::new(Shared {
-        view: Mutex::new(View { bluetooth, ..View::default() }),
+        view: Mutex::new(View::default()),
         quit,
         jack: Arc::default(),
-        settings: Mutex::new(settings::Settings::load()),
+        settings: Mutex::new({
+            let mut s = settings::Settings::load();
+            if bluetooth {
+                s.mode = Mode::Bluetooth;
+            }
+            s
+        }),
         cmds: Mutex::default(),
         pointer: Mutex::default(),
+        frames: Mutex::default(),
         wake: wake_w,
         notify: Box::new(move || {
             let _ = proxy.send_event(());
         }),
     });
     let sleep_lock = sleep::watch(shared.clone());
+    // debugging aid: SIGUSR1 flips between Wi-Fi and Bluetooth like the panel does
+    {
+        let flip = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, flip.clone());
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            while !s.quit.load(Ordering::Relaxed) {
+                if flip.swap(false, Ordering::Relaxed) {
+                    let mut st = s.settings.lock().unwrap();
+                    st.mode = if st.mode == Mode::Wifi { Mode::Bluetooth } else { Mode::Wifi };
+                    eprintln!("mode -> {:?}", st.mode);
+                    drop(st);
+                    s.poke_pub();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
     {
         let s = shared.clone();
         audio::watch_jack(shared.jack.clone(), move || {
@@ -132,11 +166,6 @@ fn main() {
             eprintln!("{msg}");
             link_shared.view.lock().unwrap().phase = Phase::Rejected(msg);
             (link_shared.notify)();
-        };
-        let token = match token {
-            Some(t) => t,
-            None if bluetooth => [0; flipad_proto::TOKEN_LEN],
-            None => return fail(format!("缺少 {}", config_dir().join("token").display())),
         };
         let path = match plumber::borrow() {
             Ok(p) => p,
@@ -166,30 +195,54 @@ fn main() {
             let _ = plumber::restore();
             return fail(format!("grab: {e}"));
         }
-        if bluetooth {
-            if let Err(e) = btlink::run(dev, wake_r, link_shared.clone()) {
-                eprintln!("bluetooth: {e}");
-            }
-            if let Err(e) = plumber::restore() {
-                eprintln!("restore: {e}");
-            }
-            link_shared.quit.store(true, Ordering::Relaxed);
-            (link_shared.notify)();
-            return;
-        }
-        wifi_power_save(false);
+
+        // one borrowed controller, two ways to reach a host; the panel switches
         let name = std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "flip2".into());
-        let cfg = link::Config { token, host, name };
-        if let Err(e) = link::run(dev, wake_r, cfg, link_shared.clone()) {
-            eprintln!("link: {e}");
+        let sh = &link_shared;
+        let mode_now = || sh.settings.lock().unwrap().mode;
+        let wait_for_switch = |from: Mode| {
+            while !sh.quit.load(Ordering::Relaxed) && mode_now() == from {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        };
+        while !sh.quit.load(Ordering::Relaxed) {
+            let mode = mode_now();
+            sh.update(|v| {
+                v.bluetooth = mode == Mode::Bluetooth;
+                v.phase = Phase::Searching;
+                v.host.clear();
+                v.rtt_ms = None;
+            });
+            let result = match mode {
+                Mode::Wifi => {
+                    let Some(token) = token else {
+                        fail(format!("缺少 {}", config_dir().join("token").display()));
+                        wait_for_switch(mode);
+                        continue;
+                    };
+                    let cfg = link::Config { token, host, name: name.clone() };
+                    wifi_power_save(false);
+                    let r = link::run(&mut dev, &wake_r, &cfg, sh.clone());
+                    wifi_power_save(true);
+                    r
+                }
+                Mode::Bluetooth => btlink::run(&mut dev, &wake_r, sh.clone()),
+            };
+            if let Err(e) = result {
+                eprintln!("{mode:?}: {e}");
+                if !controller_alive(&dev) {
+                    break;
+                }
+                // e.g. Bluetooth failed to start: keep the error up until switched
+                wait_for_switch(mode);
+            }
         }
-        // `dev` was moved into run and is closed (ungrabbed) by now
-        wifi_power_save(true);
+        drop(dev);
         if let Err(e) = plumber::restore() {
             eprintln!("restore: {e}");
         }
-        link_shared.quit.store(true, Ordering::Relaxed);
-        (link_shared.notify)();
+        sh.quit.store(true, Ordering::Relaxed);
+        (sh.notify)();
     });
 
     let mut app = ui::App::new(shared.clone());

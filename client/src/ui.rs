@@ -15,8 +15,8 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::link::{Cmd, PointerOp, Shared, View};
 use crate::paint::{Canvas, Text};
-use crate::panel::{self, FLASH, Hit, Rect, Tab, Ui};
-use crate::settings::Settings;
+use crate::panel::{self, FLASH, Hit, Rect, Tab, Target, Ui};
+use crate::settings::{Mode, Settings};
 
 const H: f32 = 1080.0;
 const FRAME: Duration = Duration::from_millis(33);
@@ -51,6 +51,7 @@ pub struct App {
     cursor: (f64, f64),
     gesture: Option<Gesture>,
     drag_lock: bool,
+    switcher: bool,
     last_touch: Option<Instant>,
     dirty: bool,
     last_draw: Instant,
@@ -73,6 +74,7 @@ impl App {
             cursor: (0.0, 0.0),
             gesture: None,
             drag_lock: false,
+            switcher: false,
             last_touch: None,
             dirty: true,
             last_draw: Instant::now() - FRAME,
@@ -187,6 +189,24 @@ impl App {
                 sh.pointer(PointerOp::Buttons(self.base_buttons()));
             }
             Hit::PointerSpeed(p) => set(&|s| s.pointer_speed = p),
+            Hit::OpenSwitcher => self.switcher = true,
+            Hit::CloseSwitcher => self.switcher = false,
+            Hit::Connect(t) => {
+                set(&|s| match t {
+                    Target::Wifi => s.mode = Mode::Wifi,
+                    Target::BtAuto => {
+                        s.mode = Mode::Bluetooth;
+                        s.bt_target = None;
+                    }
+                    Target::Bt(a) => {
+                        s.mode = Mode::Bluetooth;
+                        s.bt_target = Some(a);
+                    }
+                });
+                self.switcher = false;
+                sh.poke_pub();
+            }
+            Hit::PluginButton(id) => sh.command(Cmd::PluginButton(id)),
             Hit::Pad | Hit::ScrollStrip => {}
             Hit::Exit => self.quit(el),
             Hit::ScreenOff => sh.update(|v| v.screen_off = true),
@@ -234,8 +254,18 @@ impl App {
         let cv = self.canvas.as_mut().unwrap();
         if let Some(text) = &mut self.text {
             let fingers = self.gesture.as_ref().map_or(0, |g| g.fingers.len());
-            let mut ui =
-                Ui { cv, text, hits: &mut self.hits, flash: self.flash, now: Instant::now(), drag_lock: self.drag_lock, fingers };
+            let frames = self.shared.frames.lock().unwrap().clone();
+            let mut ui = Ui {
+                cv,
+                text,
+                hits: &mut self.hits,
+                flash: self.flash,
+                now: Instant::now(),
+                drag_lock: self.drag_lock,
+                fingers,
+                switcher: self.switcher,
+                frames: &frames,
+            };
             panel::render(&mut ui, &view, &settings, self.tab, self.battery);
         }
         if surface.resize(w, h).is_err() {
@@ -372,22 +402,77 @@ pub fn preview(path: &str) -> Result<(), String> {
         screen_off: false,
         last_action: Some((HostAction::VolumeUp, Instant::now())),
         bluetooth: false,
+        bt_hosts: vec![],
+        wifi_host: "my-desktop".into(),
+        plugin: None,
     };
     let settings = Settings { turbo: button::SOUTH | crate::settings::TURBO_RT, ..Settings::default() };
-    let tabs = [Tab::Overview, Tab::Touchpad, Tab::Quick, Tab::Macros, Tab::Settings];
-    let mut sheet = Pixmap::new(1920, 1080 * (tabs.len() as u32 + 2)).unwrap();
-    for (i, tab) in tabs.iter().chain([Tab::Overview, Tab::Overview].iter()).enumerate() {
+    let bt_settings = Settings { mode: Mode::Bluetooth, ..settings };
+    let host = |addr: &str, name: &str, connected| crate::link::BtHost {
+        addr: crate::settings::parse_addr(addr).unwrap(),
+        name: name.into(),
+        connected,
+    };
+    let bt_view = View {
+        bluetooth: true,
+        host: "MY-DESKTOP".into(),
+        rtt_ms: None,
+        bt_hosts: vec![host("12:34:56:78:9A:BC", "my-desktop", true), host("AA:BB:CC:DD:EE:01", "iPad", false)],
+        ..view.clone()
+    };
+    let game_view = View {
+        plugin: Some(crate::link::PluginPanel {
+            plugin: "demo".into(),
+            title: "插件演示".into(),
+            widgets: vec![
+                flipad_proto::Widget::Image { id: 1, aspect: 1333 },
+                flipad_proto::Widget::Text { text: "Elden Ring".into(), big: true },
+                flipad_proto::Widget::Text { text: "已玩 42 分钟".into(), big: false },
+                flipad_proto::Widget::Button { id: 1, label: "Steam 截图".into() },
+                flipad_proto::Widget::Button { id: 2, label: "Steam 叠加层".into() },
+                flipad_proto::Widget::Button { id: 3, label: "Esc / 暂停".into() },
+                flipad_proto::Widget::Button { id: 4, label: "Alt + Tab".into() },
+            ],
+        }),
+        ..view.clone()
+    };
+    // a stand-in "minimap" frame
+    let mut img = Pixmap::new(400, 300).unwrap();
+    for (i, px) in img.pixels_mut().iter_mut().enumerate() {
+        let (x, y) = ((i % 400) as u8, (i / 400) as u8);
+        *px = tiny_skia::ColorU8::from_rgba(x / 3, 60 + y / 3, 90, 255).premultiply();
+    }
+    let frames: std::collections::HashMap<u16, std::sync::Arc<Pixmap>> = [(1u16, std::sync::Arc::new(img))].into();
+
+    let pages: Vec<(Tab, View, Settings, bool)> = vec![
+        (Tab::Overview, view.clone(), settings, false),
+        (Tab::Game, game_view, settings, false),
+        (Tab::Touchpad, view.clone(), settings, false),
+        (Tab::Quick, view.clone(), settings, false),
+        (Tab::Macros, view.clone(), settings, false),
+        (Tab::Settings, view.clone(), settings, false),
+        (Tab::Overview, View { screen_off: true, ..view.clone() }, settings, false),
+        (Tab::Overview, bt_view.clone(), bt_settings, false),
+        (Tab::Settings, bt_view.clone(), bt_settings, false),
+        (Tab::Overview, bt_view, bt_settings, true),
+    ];
+    let mut sheet = Pixmap::new(1920, 1080 * pages.len() as u32).unwrap();
+    for (i, (tab, v, st, switcher)) in pages.into_iter().enumerate() {
         let mut cv = Canvas { pm: Pixmap::new(1920, 1080).unwrap(), ts: Transform::identity(), scale: 1.0, ox: 0.0, oy: 0.0 };
         let mut hits = Vec::new();
-        let v = View {
-            screen_off: i == tabs.len(),
-            bluetooth: i == tabs.len() + 1,
-            host: if i == tabs.len() + 1 { "MY-DESKTOP".into() } else { view.host.clone() },
-            ..view.clone()
+        let flash = (tab == Tab::Quick).then(|| (Hit::Action(HostAction::PlayPause), Instant::now()));
+        let mut ui = Ui {
+            cv: &mut cv,
+            text: &mut text,
+            hits: &mut hits,
+            flash,
+            now: Instant::now(),
+            drag_lock: false,
+            fingers: 0,
+            switcher,
+            frames: &frames,
         };
-        let flash = (*tab == Tab::Quick).then(|| (Hit::Action(HostAction::PlayPause), Instant::now()));
-        let mut ui = Ui { cv: &mut cv, text: &mut text, hits: &mut hits, flash, now: Instant::now(), drag_lock: false, fingers: 0 };
-        panel::render(&mut ui, &v, &settings, *tab, (Some(76), false));
+        panel::render(&mut ui, &v, &st, tab, (Some(76), false));
         sheet.draw_pixmap(0, (i * 1080) as i32, cv.pm.as_ref(), &Default::default(), Default::default(), None);
     }
     sheet.save_png(path).map_err(|e| e.to_string())

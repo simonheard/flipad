@@ -97,6 +97,21 @@ pub struct Status {
     pub mem_pct: Option<u8>,
 }
 
+/// One element of a game plugin's panel on the handheld.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Widget {
+    /// A line of text; `big` for headings and values.
+    Text { text: String, big: bool },
+    /// A tappable button; taps come back as `Msg::PluginButton` with `id`.
+    Button { id: u16, label: String },
+    /// An image streamed with `Msg::Frame` under `id` (e.g. a minimap).
+    /// `aspect` is width / height × 1000.
+    Image { id: u16, aspect: u16 },
+}
+
+/// Largest frame chunk payload; keeps datagrams under a typical MTU.
+pub const FRAME_CHUNK: usize = 1200;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     /// client → broadcast: looking for hosts.
@@ -124,6 +139,12 @@ pub enum Msg {
     /// 1/120 notches); `buttons` is the full state (bit 0 left, 1 right,
     /// 2 middle). A packet may be sent twice; the host drops old `seq`.
     Pointer { session: u32, seq: u32, dx: i16, dy: i16, wheel: i16, hwheel: i16, buttons: u8 },
+    /// host → client: the active game plugin's panel; empty `plugin` = none.
+    Panel { plugin: String, title: String, widgets: Vec<Widget> },
+    /// host → client: one chunk of a JPEG for an image widget.
+    Frame { image: u16, frame: u32, part: u16, parts: u16, data: Vec<u8> },
+    /// client → host: a plugin button was tapped.
+    PluginButton { session: u32, plugin: String, id: u16 },
 }
 
 mod kind {
@@ -141,6 +162,9 @@ mod kind {
     pub const JACK: u8 = 12;
     pub const ACTION: u8 = 13;
     pub const POINTER: u8 = 14;
+    pub const PANEL: u8 = 15;
+    pub const FRAME: u8 = 16;
+    pub const PLUGIN_BUTTON: u8 = 17;
 }
 
 struct W(Vec<u8>);
@@ -175,6 +199,10 @@ impl W {
     fn bytes(mut self, b: &[u8]) -> Self {
         self.0.extend_from_slice(b);
         self
+    }
+    fn blob(self, b: &[u8]) -> Self {
+        let b = &b[..b.len().min(u16::MAX as usize)];
+        self.u16(b.len() as u16).bytes(b)
     }
     fn str(self, s: &str) -> Self {
         let b = &s.as_bytes()[..s.len().min(255)];
@@ -215,6 +243,10 @@ impl<'a> R<'a> {
     }
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn blob(&mut self) -> Option<Vec<u8>> {
+        let n = self.u16()? as usize;
+        Some(self.take(n)?.to_vec())
     }
     fn str(&mut self) -> Option<String> {
         let n = self.u8()? as usize;
@@ -262,6 +294,21 @@ impl Msg {
                 W::new(kind::JACK).u32(*session).u8(*headphones as u8 | (*mic as u8) << 1)
             }
             Msg::Action { session, id, action } => W::new(kind::ACTION).u32(*session).u32(*id).u8(*action as u8),
+            Msg::Panel { plugin, title, widgets } => {
+                let mut w = W::new(kind::PANEL).str(plugin).str(title).u8(widgets.len().min(255) as u8);
+                for wd in widgets.iter().take(255) {
+                    w = match wd {
+                        Widget::Text { text, big } => w.u8(1).str(text).u8(*big as u8),
+                        Widget::Button { id, label } => w.u8(2).u16(*id).str(label),
+                        Widget::Image { id, aspect } => w.u8(3).u16(*id).u16(*aspect),
+                    };
+                }
+                w
+            }
+            Msg::Frame { image, frame, part, parts, data } => {
+                W::new(kind::FRAME).u16(*image).u32(*frame).u16(*part).u16(*parts).blob(data)
+            }
+            Msg::PluginButton { session, plugin, id } => W::new(kind::PLUGIN_BUTTON).u32(*session).str(plugin).u16(*id),
             Msg::Pointer { session, seq, dx, dy, wheel, hwheel, buttons } => W::new(kind::POINTER)
                 .u32(*session)
                 .u32(*seq)
@@ -309,6 +356,23 @@ impl Msg {
                 mem_pct: r.opt_u8()?,
             }),
             kind::BYE => Msg::Bye { session: r.u32()? },
+            kind::PANEL => {
+                let plugin = r.str()?;
+                let title = r.str()?;
+                let n = r.u8()?;
+                let mut widgets = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    widgets.push(match r.u8()? {
+                        1 => Widget::Text { text: r.str()?, big: r.u8()? != 0 },
+                        2 => Widget::Button { id: r.u16()?, label: r.str()? },
+                        3 => Widget::Image { id: r.u16()?, aspect: r.u16()? },
+                        _ => return None,
+                    });
+                }
+                Msg::Panel { plugin, title, widgets }
+            }
+            kind::FRAME => Msg::Frame { image: r.u16()?, frame: r.u32()?, part: r.u16()?, parts: r.u16()?, data: r.blob()? },
+            kind::PLUGIN_BUTTON => Msg::PluginButton { session: r.u32()?, plugin: r.str()?, id: r.u16()? },
             kind::POINTER => Msg::Pointer {
                 session: r.u32()?,
                 seq: r.u32()?,
@@ -370,6 +434,18 @@ mod tests {
             Msg::Jack { session: 4, headphones: false, mic: true },
             Msg::Action { session: 4, id: 7, action: HostAction::BigPicture },
             Msg::Pointer { session: 4, seq: 9, dx: -300, dy: 12, wheel: -120, hwheel: 5, buttons: 0b101 },
+            Msg::Panel {
+                plugin: "minimap".into(),
+                title: "小地图".into(),
+                widgets: vec![
+                    Widget::Text { text: "第 3 关".into(), big: true },
+                    Widget::Button { id: 7, label: "标记".into() },
+                    Widget::Image { id: 1, aspect: 1333 },
+                ],
+            },
+            Msg::Panel { plugin: String::new(), title: String::new(), widgets: vec![] },
+            Msg::Frame { image: 1, frame: 42, part: 2, parts: 5, data: vec![0xFF, 0xD8, 1, 2, 3] },
+            Msg::PluginButton { session: 4, plugin: "minimap".into(), id: 7 },
         ];
         for m in msgs {
             assert_eq!(Msg::decode(&m.encode()), Some(m.clone()), "{m:?}");

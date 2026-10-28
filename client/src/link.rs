@@ -12,10 +12,11 @@ use evdev::{
     AbsoluteAxisCode as Abs, EventType, FFEffect, FFEffectData, FFEffectKind, FFReplay, FFTrigger, InputEvent,
     KeyCode,
 };
-use flipad_proto::{HostAction, Msg, PORT, Pad, Status, TOKEN_LEN, button};
+use flipad_proto::{HostAction, Msg, PORT, Pad, Status, TOKEN_LEN, Widget, button};
+use tiny_skia::Pixmap;
 
 use crate::audio::{Audio, Jack, Want};
-use crate::settings::{MACRO_SLOTS, Settings, load_macros, save_macros};
+use crate::settings::{Addr, MACRO_SLOTS, Mode, Settings, load_macros, save_macros};
 use crate::shaper::{Event, Shaper};
 
 /// Re-send the current state this often even when nothing changes, so a lost
@@ -60,6 +61,26 @@ pub struct View {
     /// Running as a Bluetooth controller (no host service: no shortcuts,
     /// touchpad, audio or host readings).
     pub bluetooth: bool,
+    /// Bluetooth hosts that have used this controller, and which is connected.
+    pub bt_hosts: Vec<BtHost>,
+    /// Name of the Wi-Fi host last connected to.
+    pub wifi_host: String,
+    /// The active game plugin's panel on the host, if any.
+    pub plugin: Option<PluginPanel>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BtHost {
+    pub addr: Addr,
+    pub name: String,
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginPanel {
+    pub plugin: String,
+    pub title: String,
+    pub widgets: Vec<Widget>,
 }
 
 /// Touchpad input queued by the panel, in design pixels.
@@ -80,6 +101,7 @@ pub enum Cmd {
     StopRecording,
     Play(usize),
     Clear(usize),
+    PluginButton(u16),
 }
 
 pub struct Shared {
@@ -89,6 +111,8 @@ pub struct Shared {
     pub settings: Mutex<Settings>,
     pub cmds: Mutex<Vec<Cmd>>,
     pub pointer: Mutex<Vec<PointerOp>>,
+    /// Latest decoded image per plugin image widget.
+    pub frames: Mutex<std::collections::HashMap<u16, Arc<Pixmap>>>,
     /// Write end of a pipe the forwarding loop polls, to act on panel input
     /// immediately instead of at its next keepalive.
     pub wake: std::os::fd::OwnedFd,
@@ -104,6 +128,11 @@ impl Shared {
 
     pub fn pointer(&self, op: PointerOp) {
         self.pointer.lock().unwrap().push(op);
+        self.poke();
+    }
+
+    /// Wakes the forwarding loop (e.g. after a settings change).
+    pub fn poke_pub(&self) {
         self.poke();
     }
 
@@ -233,7 +262,8 @@ fn open_socket() -> std::io::Result<UdpSocket> {
 }
 
 /// Runs until `shared.quit` is set. `dev` must already be grabbed.
-pub fn run(dev: RawDevice, wake: std::os::fd::OwnedFd, cfg: Config, shared: Arc<Shared>) -> std::io::Result<()> {
+/// Runs until quit or until the panel switches to Bluetooth.
+pub fn run(dev: &mut RawDevice, wake: &std::os::fd::OwnedFd, cfg: &Config, shared: Arc<Shared>) -> std::io::Result<()> {
     let sock = open_socket()?;
     let mut ended = Ended { sock: &sock, to: None };
     serve(dev, wake, cfg, shared, &sock, &mut ended)
@@ -257,9 +287,9 @@ impl Drop for Ended<'_> {
 }
 
 fn serve(
-    mut dev: RawDevice,
-    wake: std::os::fd::OwnedFd,
-    cfg: Config,
+    dev: &mut RawDevice,
+    wake: &std::os::fd::OwnedFd,
+    cfg: &Config,
     shared: Arc<Shared>,
     sock: &UdpSocket,
     ended: &mut Ended,
@@ -281,7 +311,7 @@ fn serve(
     // sub-unit leftovers so slow finger motion is not rounded away
     let mut pointer_rest = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut motor = Motor { effect: None };
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 2048];
     let mut shaper = Shaper::new(load_macros(), Instant::now());
     let mut events: Vec<Event> = Vec::new();
     let mut settings = *shared.settings.lock().unwrap();
@@ -303,7 +333,8 @@ fn serve(
         let _ = sock.send_to(&m.encode(), to);
     };
 
-    while !shared.quit.load(Ordering::Relaxed) {
+    let mut frames: std::collections::HashMap<u16, (u32, Vec<Option<Vec<u8>>>)> = Default::default();
+    while !shared.quit.load(Ordering::Relaxed) && shared.settings.lock().unwrap().mode == Mode::Wifi {
         ended.to = host.zip(session);
         let now = Instant::now();
         let mut wake_at = last_send + KEEPALIVE;
@@ -332,7 +363,7 @@ fn serve(
                 routed = None;
             }
             if !new_settings.rumble {
-                motor.play(&mut dev, 0, 0, 0);
+                motor.play(dev, 0, 0, 0);
             }
             settings = new_settings;
         }
@@ -360,6 +391,14 @@ fn serve(
                 Cmd::Clear(i) => {
                     shaper.clear(i);
                     macros_changed = true;
+                }
+                Cmd::PluginButton(id) => {
+                    let plugin = shared.view.lock().unwrap().plugin.as_ref().map(|p| p.plugin.clone());
+                    if let (Some(to), Some(sid), Some(plugin)) = (host, session, plugin) {
+                        for _ in 0..2 {
+                            send(to, &Msg::PluginButton { session: sid, plugin: plugin.clone(), id });
+                        }
+                    }
                 }
             }
         }
@@ -479,6 +518,7 @@ fn serve(
                         last_pong = now;
                         sent = Pad { buttons: !out.buttons, ..out }; // force a full send
                         shared.update(|v| {
+                            v.wifi_host = name.clone();
                             v.host = name;
                             v.phase = Phase::Connected;
                         });
@@ -499,11 +539,32 @@ fn serve(
                     }
                     Some(Msg::Rumble { strong, weak, ms }) if Some(from) == host => {
                         if settings.rumble {
-                            motor.play(&mut dev, strong, weak, ms);
+                            motor.play(dev, strong, weak, ms);
                             shared.update(|v| v.rumble = strong > 0 || weak > 0);
                         }
                     }
                     Some(Msg::Status(s)) if Some(from) == host => shared.update(|v| v.status = s),
+                    Some(Msg::Panel { plugin, title, widgets }) if Some(from) == host => {
+                        let p = (!plugin.is_empty()).then_some(PluginPanel { plugin, title, widgets });
+                        if shared.view.lock().unwrap().plugin != p {
+                            eprintln!("plugin panel: {:?}", p.as_ref().map(|p| (&p.plugin, &p.title, p.widgets.len())));
+                            if p.is_none() {
+                                shared.frames.lock().unwrap().clear();
+                            }
+                            shared.update(|v| v.plugin = p);
+                        }
+                    }
+                    Some(Msg::Frame { image, frame, part, parts, data }) if Some(from) == host => {
+                        if let Some(jpeg) = assemble(&mut frames, image, frame, part, parts, data)
+                            && let Some(pm) = decode_jpeg(&jpeg)
+                        {
+                            if !shared.frames.lock().unwrap().contains_key(&image) {
+                                eprintln!("plugin image {image}: first frame {}x{}", pm.width(), pm.height());
+                            }
+                            shared.frames.lock().unwrap().insert(image, Arc::new(pm));
+                            (shared.notify)();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -568,9 +629,50 @@ fn serve(
         save_macros(&shaper.macros);
     }
     drop(audio);
-    motor.play(&mut dev, 0, 0, 0);
+    motor.play(dev, 0, 0, 0);
     ended.to = host.zip(session);
+    shared.frames.lock().unwrap().clear();
+    shared.update(|v| v.plugin = None);
     Ok(())
+}
+
+/// Collects frame chunks; returns the whole JPEG once every part is in.
+/// An older frame still in flight is dropped when a newer one starts.
+fn assemble(
+    pending: &mut std::collections::HashMap<u16, (u32, Vec<Option<Vec<u8>>>)>,
+    image: u16,
+    frame: u32,
+    part: u16,
+    parts: u16,
+    data: Vec<u8>,
+) -> Option<Vec<u8>> {
+    if parts == 0 || part >= parts || parts > 512 {
+        return None;
+    }
+    let slot = pending.entry(image).or_insert_with(|| (frame, vec![None; parts as usize]));
+    if slot.0 != frame {
+        if !flipad_proto::seq_newer(frame, slot.0) {
+            return None;
+        }
+        *slot = (frame, vec![None; parts as usize]);
+    }
+    slot.1[part as usize] = Some(data);
+    if slot.1.iter().all(Option::is_some) {
+        let jpeg = slot.1.iter_mut().flat_map(|c| c.take().unwrap()).collect();
+        pending.remove(&image);
+        return Some(jpeg);
+    }
+    None
+}
+
+fn decode_jpeg(jpeg: &[u8]) -> Option<Pixmap> {
+    let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
+        .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(zune_jpeg::zune_core::bytestream::ZCursor::new(jpeg), opts);
+    let rgba = dec.decode().ok()?;
+    let info = dec.info()?;
+    let (w, h) = (info.width, info.height);
+    Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(w as u32, h as u32)?)
 }
 
 #[cfg(test)]
@@ -579,6 +681,16 @@ mod tests {
 
     fn ev(t: EventType, code: u16, v: i32) -> InputEvent {
         InputEvent::new(t.0, code, v)
+    }
+
+    #[test]
+    fn frames_reassemble_and_drop_stale() {
+        let mut p = Default::default();
+        assert_eq!(assemble(&mut p, 1, 5, 1, 2, vec![3, 4]), None);
+        assert_eq!(assemble(&mut p, 1, 5, 0, 2, vec![1, 2]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(assemble(&mut p, 1, 7, 0, 2, vec![9]), None);
+        assert_eq!(assemble(&mut p, 1, 6, 1, 2, vec![8]), None, "older frame ignored");
+        assert_eq!(assemble(&mut p, 1, 7, 1, 2, vec![10]), Some(vec![9, 10]));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Bluetooth LE HID (HOGP) peripheral that looks like an Xbox Wireless
+//! Bluetooth LE HID (HOGP) peripheral that reports as an Xbox Wireless
 //! Controller (045e:0b13, firmware 5.x report layout), so Windows, Linux,
 //! macOS and Steam drive it with their own Xbox support — nothing to install
 //! on the host. The PnP ID comes from BlueZ's `DeviceID` in main.conf.
@@ -12,11 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use flipad_proto::{Pad, button};
+
+use crate::settings::{Addr, addr_str, parse_addr};
 use zbus::blocking::{Connection, Proxy, connection};
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
-pub const NAME: &str = "Xbox Wireless Controller";
+/// What hosts list us as. Their Xbox support keys off the PnP ID, not the name.
+pub const NAME: &str = "Flip Pad";
 const APP: &str = "/flipad";
 const INPUT: &str = "/flipad/hid/input";
 const BATTERY_LEVEL: &str = "/flipad/battery/level";
@@ -299,6 +302,8 @@ pub struct Peripheral {
     battery: Arc<Mutex<Vec<u8>>>,
     pub rumble: mpsc::Receiver<Rumble>,
     peer: Arc<Mutex<Option<OwnedObjectPath>>>,
+    /// Hosts whose Blocked flag we manage, unblocked again on exit.
+    blocked: Mutex<Vec<Addr>>,
 }
 
 fn adapter(conn: &Connection, iface: &'static str) -> zbus::Result<Proxy<'static>> {
@@ -433,7 +438,7 @@ impl Peripheral {
             }
         });
 
-        Ok(Self { conn, input_notifying, input_value, battery, rumble: rumble_rx, peer })
+        Ok(Self { conn, input_notifying, input_value, battery, rumble: rumble_rx, peer, blocked: Mutex::default() })
     }
 
     /// True once a host has subscribed to the input report.
@@ -441,18 +446,40 @@ impl Peripheral {
         self.input_notifying.load(Ordering::Relaxed)
     }
 
-    /// Name of the connected host, if any.
-    pub fn connected_host(&self) -> Option<String> {
-        let om = zbus::blocking::fdo::ObjectManagerProxy::builder(&self.conn).destination("org.bluez").ok()?.path("/").ok()?.build().ok()?;
-        for (_, ifaces) in om.get_managed_objects().ok()? {
-            let Some(dev) = ifaces.get("org.bluez.Device1") else { continue };
-            let connected = dev.get("Connected").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
-            if connected {
-                let name = dev.get("Alias").and_then(|v| String::try_from(v.try_clone().ok()?).ok());
-                return Some(name.unwrap_or_else(|| "蓝牙主机".into()));
-            }
+    /// Address and name of the host that last used the controller.
+    pub fn peer(&self) -> Option<(Addr, String)> {
+        let dev = self.peer.lock().unwrap().clone()?;
+        let props = zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez").ok()?.path(dev).ok()?.build().ok()?;
+        let iface = "org.bluez.Device1".try_into().ok()?;
+        let addr: String = props.get(iface, "Address").ok().and_then(|v| String::try_from(v).ok())?;
+        let name = props.get("org.bluez.Device1".try_into().ok()?, "Alias").ok().and_then(|v| String::try_from(v).ok());
+        Some((parse_addr(&addr)?, name.unwrap_or_else(|| addr.clone())))
+    }
+
+    fn device(&self, addr: &Addr) -> Option<zbus::blocking::fdo::PropertiesProxy<'static>> {
+        let path = format!("/org/bluez/hci0/dev_{}", addr_str(addr).replace(':', "_"));
+        zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez").ok()?.path(path).ok()?.build().ok()
+    }
+
+    /// Whether a known host is connected right now.
+    pub fn is_connected(&self, addr: &Addr) -> bool {
+        self.device(addr)
+            .and_then(|p| p.get("org.bluez.Device1".try_into().ok()?, "Connected").ok())
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(false)
+    }
+
+    /// Lets only `target` connect (None = any). Others are blocked, which
+    /// keeps their pairing but rejects their connections, and dropped if
+    /// connected. Only hosts in `known` are touched, never other devices.
+    pub fn apply_target(&self, target: Option<&Addr>, known: &[Addr]) {
+        for a in known {
+            let block = target.is_some_and(|t| t != a);
+            let Some(p) = self.device(a) else { continue };
+            let Ok(iface) = "org.bluez.Device1".try_into() else { continue };
+            let _ = p.set(iface, "Blocked", Value::from(block));
         }
-        None
+        self.blocked.lock().unwrap().clone_from(&known.to_vec());
     }
 
     fn notify(&self, path: &str, value: &Arc<Mutex<Vec<u8>>>, data: &[u8]) {
@@ -498,6 +525,8 @@ impl Drop for Peripheral {
     fn drop(&mut self) {
         // cheapest and most visible first, in case we are killed midway
         restore_alias();
+        let known = std::mem::take(&mut *self.blocked.lock().unwrap());
+        self.apply_target(None, &known);
         // tell the host right away instead of letting the link time out
         if let Some(dev) = self.peer.lock().unwrap().take()
             && let Ok(p) = Proxy::new(&self.conn, "org.bluez", dev, "org.bluez.Device1")

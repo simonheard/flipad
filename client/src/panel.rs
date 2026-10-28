@@ -6,11 +6,16 @@
 
 use std::time::{Duration, Instant};
 
-use flipad_proto::{HostAction, Pad, button};
+use flipad_proto::{HostAction, Pad, Widget, button};
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tiny_skia::{FilterQuality, Pixmap, PixmapPaint};
 
 use crate::link::{Phase, View};
 use crate::paint::{Align, Canvas, Text, circle, rgba, rrect};
-use crate::settings::{MACRO_SLOTS, Settings, TURBO_LT, TURBO_RT};
+use crate::settings::{Addr, MACRO_SLOTS, Mode, Settings, TURBO_LT, TURBO_RT};
 
 pub const W: f32 = 1920.0;
 const M: f32 = 32.0;
@@ -36,19 +41,36 @@ pub const FLASH: Duration = Duration::from_millis(180);
 pub enum Tab {
     #[default]
     Overview,
+    Game,
     Touchpad,
     Quick,
     Macros,
     Settings,
 }
 
-const TABS: [(Tab, &str); 5] = [
-    (Tab::Overview, "概览"),
-    (Tab::Touchpad, "触控板"),
-    (Tab::Quick, "快捷"),
-    (Tab::Macros, "宏 / 连发"),
-    (Tab::Settings, "设置"),
-];
+/// Tabs for the current state: Bluetooth hides what needs the host service,
+/// and the game tab appears while a game plugin is active.
+pub fn tabs(v: &View) -> Vec<(Tab, &'static str)> {
+    let mut t = vec![(Tab::Overview, "概览")];
+    if !v.bluetooth {
+        if v.plugin.is_some() {
+            t.push((Tab::Game, "游戏"));
+        }
+        t.push((Tab::Touchpad, "触控板"));
+        t.push((Tab::Quick, "快捷"));
+    }
+    t.push((Tab::Macros, "宏 / 连发"));
+    t.push((Tab::Settings, "设置"));
+    t
+}
+
+/// Where the controller sends its input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Target {
+    Wifi,
+    BtAuto,
+    Bt(Addr),
+}
 
 /// Something on screen that reacts to a touch.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,6 +92,10 @@ pub enum Hit {
     Mic,
     Latency(u32),
     PointerSpeed(u32),
+    OpenSwitcher,
+    CloseSwitcher,
+    Connect(Target),
+    PluginButton(u16),
     /// The touchpad surface; handled as a gesture, not a tap.
     Pad,
     /// Vertical strip that scrolls; also a gesture.
@@ -89,6 +115,8 @@ pub struct Ui<'a> {
     /// Touchpad state for drawing: drag lock on, fingers down.
     pub drag_lock: bool,
     pub fingers: usize,
+    pub switcher: bool,
+    pub frames: &'a HashMap<u16, Arc<Pixmap>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -208,16 +236,125 @@ pub fn render(ui: &mut Ui, v: &View, s: &Settings, tab: Tab, battery: (Option<u8
         return;
     }
     ui.cv.pm.fill(rgba(BG, 1.0));
+    let tabs = tabs(v);
+    let tab = if tabs.iter().any(|t| t.0 == tab) { tab } else { Tab::Overview };
     status_bar(ui, v, battery);
     match tab {
         Tab::Overview => overview(ui, v),
-        Tab::Touchpad | Tab::Quick if v.bluetooth => wifi_only(ui),
+        Tab::Game => game(ui, v),
         Tab::Touchpad => touchpad(ui),
         Tab::Quick => quick(ui),
         Tab::Macros => macros(ui, v, s),
-        Tab::Settings => settings(ui, s),
+        Tab::Settings => settings(ui, v, s),
     }
-    tab_bar(ui, tab);
+    tab_bar(ui, &tabs, tab);
+    if ui.switcher {
+        switcher(ui, v, s);
+    }
+}
+
+fn target_label(v: &View, t: Target) -> String {
+    match t {
+        Target::Wifi => format!("Wi-Fi · {}", if v.wifi_host.is_empty() { "电脑" } else { &v.wifi_host }),
+        Target::BtAuto => "蓝牙 · 自动".into(),
+        Target::Bt(a) => format!(
+            "蓝牙 · {}",
+            v.bt_hosts.iter().find(|h| h.addr == a).map_or(crate::settings::addr_str(&a).to_string(), |h| h.name.clone())
+        ),
+    }
+}
+
+pub fn current_target(s: &Settings) -> Target {
+    match (s.mode, s.bt_target) {
+        (Mode::Wifi, _) => Target::Wifi,
+        (Mode::Bluetooth, None) => Target::BtAuto,
+        (Mode::Bluetooth, Some(a)) => Target::Bt(a),
+    }
+}
+
+/// Modal list of places to connect to.
+fn switcher(ui: &mut Ui, v: &View, s: &Settings) {
+    ui.hits.clear();
+    ui.hits.push((Rect { x: 0.0, y: 0.0, w: W, h: 1080.0 }, Hit::CloseSwitcher));
+    ui.cv.fill(&rrect(0.0, 0.0, W, 1080.0, 0.0), rgba(0x000000, 0.6));
+    let mut options = vec![Target::Wifi, Target::BtAuto];
+    options.extend(v.bt_hosts.iter().map(|h| Target::Bt(h.addr)));
+    let (w, row) = (1100.0, 112.0);
+    let h = 150.0 + options.len() as f32 * (row + 16.0) + 90.0;
+    let (x, y) = ((W - w) / 2.0, ((1080.0 - h) / 2.0).max(20.0));
+    ui.hits.push((Rect { x, y, w, h }, Hit::OpenSwitcher)); // taps on the card keep it open
+    ui.card(x, y, w, h);
+    ui.text("连接到", x + 40.0, y + 72.0, 48.0, TEXT, true, Align::Left);
+    ui.button(Hit::CloseSwitcher, x + w - 40.0 - 180.0, y + 24.0, 180.0, 80.0, "关闭", 34.0, false, ACCENT);
+    let cur = current_target(s);
+    for (i, t) in options.into_iter().enumerate() {
+        let ry = y + 130.0 + i as f32 * (row + 16.0);
+        let mut label = target_label(v, t);
+        if let Target::Bt(a) = t
+            && v.bt_hosts.iter().any(|h| h.addr == a && h.connected)
+        {
+            label += "（已连接）";
+        }
+        if t == Target::BtAuto {
+            label += "（任一已配对设备）";
+        }
+        ui.button(Hit::Connect(t), x + 40.0, ry, w - 80.0, row, &label, 38.0, t == cur, ACCENT);
+    }
+    let hint = "新设备：切到蓝牙后，在电脑或手机的蓝牙设置里配对「Flip Pad」";
+    ui.text(hint, x + 40.0, y + h - 40.0, 28.0, DIM, false, Align::Left);
+}
+
+fn game(ui: &mut Ui, v: &View) {
+    let Some(p) = &v.plugin else { return };
+    let (x, y) = (M, TOP + 8.0);
+    let (w, h) = (W - 2.0 * M, BOTTOM - 8.0 - y);
+    ui.card(x, y, w, h);
+    let image = p.widgets.iter().find_map(|wd| if let Widget::Image { id, aspect } = wd { Some((*id, *aspect)) } else { None });
+    // an image (minimap…) takes the left side at its own aspect ratio
+    let mut cx = x + 40.0;
+    if let Some((id, aspect)) = image {
+        let ih = h - 80.0;
+        let iw = (ih * aspect.max(1) as f32 / 1000.0).min(w * 0.62);
+        let ih = iw * 1000.0 / aspect.max(1) as f32;
+        let (ix, iy) = (x + 40.0, y + (h - ih) / 2.0);
+        ui.cv.fill(&rrect(ix, iy, iw, ih, 16.0), rgba(0x000000, 1.0));
+        if let Some(pm) = ui.frames.get(&id).cloned() {
+            let sx = iw / pm.width() as f32;
+            let sy = ih / pm.height() as f32;
+            let ts = ui.cv.ts.pre_translate(ix, iy).pre_scale(sx, sy);
+            let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
+            ui.cv.pm.draw_pixmap(0, 0, pm.as_ref().as_ref(), &paint, ts, None);
+        } else {
+            ui.text("等待画面…", ix + iw / 2.0, iy + ih / 2.0, 32.0, DIM, false, Align::Center);
+        }
+        cx = ix + iw + 40.0;
+    }
+    let cw = x + w - 40.0 - cx;
+    let mut ty = y + 76.0;
+    ui.text(&p.title, cx, ty, 30.0, DIM, true, Align::Left);
+    ty += 30.0;
+    for wd in &p.widgets {
+        if let Widget::Text { text, big } = wd {
+            let size = if *big { 52.0 } else { 32.0 };
+            ty += size + 18.0;
+            ui.text(text, cx, ty, size, if *big { TEXT } else { DIM }, *big, Align::Left);
+        }
+    }
+    let buttons: Vec<(u16, &str)> =
+        p.widgets.iter().filter_map(|wd| if let Widget::Button { id, label } = wd { Some((*id, label.as_str())) } else { None }).collect();
+    if !buttons.is_empty() {
+        let cols = if cw > 900.0 { 3 } else { 2 };
+        let rows = buttons.len().div_ceil(cols);
+        let gap = 20.0;
+        let top = ty + 40.0;
+        let bh = ((y + h - 40.0 - top - (rows as f32 - 1.0) * gap) / rows as f32).clamp(90.0, 170.0);
+        let bw = (cw - (cols as f32 - 1.0) * gap) / cols as f32;
+        for (i, (id, label)) in buttons.into_iter().enumerate() {
+            let bx = cx + (i % cols) as f32 * (bw + gap);
+            let by = top + (i / cols) as f32 * (bh + gap);
+            ui.button(Hit::PluginButton(id), bx, by, bw, bh, label, 40.0, false, ACCENT);
+        }
+    }
 }
 
 fn status_bar(ui: &mut Ui, v: &View, battery: (Option<u8>, bool)) {
@@ -261,7 +398,8 @@ fn status_bar(ui: &mut Ui, v: &View, battery: (Option<u8>, bool)) {
         }
         ui.text(&parts.join("　·　"), M, 124.0, 28.0, DIM, false, Align::Left);
     }
-    let _ = x;
+    // small: switch between Wi-Fi and Bluetooth hosts
+    ui.button(Hit::OpenSwitcher, x, 40.0, 150.0, 56.0, "切换", 28.0, false, ACCENT);
 
     if v.exit_hold > 0.0 {
         ui.bar(M, 132.0, 700.0, 8.0, v.exit_hold, BAD);
@@ -275,11 +413,11 @@ fn status_bar(ui: &mut Ui, v: &View, battery: (Option<u8>, bool)) {
     ui.text("退出", r.x + r.w / 2.0, r.y + 62.0, 40.0, BAD, true, Align::Center);
 }
 
-fn tab_bar(ui: &mut Ui, tab: Tab) {
+fn tab_bar(ui: &mut Ui, tabs: &[(Tab, &str)], tab: Tab) {
     let (y, h) = (BOTTOM + 16.0, 1080.0 - BOTTOM - 16.0 - 16.0);
-    let tw = (W - 2.0 * M) / TABS.len() as f32;
+    let tw = (W - 2.0 * M) / tabs.len() as f32;
     ui.cv.fill(&rrect(M, y, W - 2.0 * M, h, 36.0), rgba(CARD, 1.0));
-    for (i, (t, label)) in TABS.into_iter().enumerate() {
+    for (i, &(t, label)) in tabs.iter().enumerate() {
         let x = M + i as f32 * tw;
         ui.hits.push((Rect { x, y, w: tw, h }, Hit::Tab(t)));
         let selected = t == tab;
@@ -290,13 +428,6 @@ fn tab_bar(ui: &mut Ui, tab: Tab) {
         let c = if selected { TEXT } else { DIM };
         ui.text(label, x + tw / 2.0, y + h / 2.0 + 15.0, 42.0, c, selected, Align::Center);
     }
-}
-
-fn wifi_only(ui: &mut Ui) {
-    let (y, h) = (TOP + 8.0, BOTTOM - 8.0 - TOP - 8.0);
-    ui.card(M, y, W - 2.0 * M, h);
-    ui.text("蓝牙模式下不可用", W / 2.0, y + h / 2.0 - 20.0, 52.0, TEXT, true, Align::Center);
-    ui.text("快捷操作和触控板需要电脑上的 flipad 服务，请用 Wi-Fi 模式", W / 2.0, y + h / 2.0 + 50.0, 32.0, DIM, false, Align::Center);
 }
 
 fn bluetooth_info(ui: &mut Ui, v: &View, x: f32, w: f32) {
@@ -315,13 +446,12 @@ fn bluetooth_info(ui: &mut Ui, v: &View, x: f32, w: f32) {
     ty += 90.0;
     let lines = [
         "第一次使用：在电脑或手机的蓝牙设置里",
-        "搜索并配对「Xbox Wireless Controller」",
+        "搜索并配对「Flip Pad」",
         "",
         "配对过的设备打开蓝牙后会自动重连",
         "电脑上不用装任何东西，按 Xbox 手柄识别",
         "",
-        "布局切换、连发、宏照常可用",
-        "快捷操作、触控板、耳机音频需要 Wi-Fi 模式",
+        "多台设备：点左上角「切换」选择连哪一台",
     ];
     for l in lines {
         if !l.is_empty() {
@@ -496,39 +626,52 @@ fn macros(ui: &mut Ui, v: &View, s: &Settings) {
     }
 }
 
-fn settings(ui: &mut Ui, s: &Settings) {
+fn settings(ui: &mut Ui, v: &View, s: &Settings) {
     let (y, h) = (TOP + 8.0, BOTTOM - 8.0 - TOP - 8.0);
     let w = (W - 2.0 * M - 24.0) / 2.0;
 
     let x = M;
     ui.card(x, y, w, h);
     let (ix, iw) = (x + 36.0, w - 72.0);
-    ui.text("按键布局", ix, y + 66.0, 42.0, TEXT, true, Align::Left);
-    ui.text("任天堂：对调 A/B 和 X/Y", ix, y + 112.0, 28.0, DIM, false, Align::Left);
+    ui.text("连接", ix, y + 66.0, 42.0, TEXT, true, Align::Left);
+    ui.text(&target_label(v, current_target(s)), ix, y + 116.0, 32.0, ACCENT, true, Align::Left);
+    ui.button(Hit::OpenSwitcher, ix + iw - 200.0, y + 34.0, 200.0, 96.0, "切换", 38.0, false, ACCENT);
+    ui.text("按键布局", ix, y + 230.0, 42.0, TEXT, true, Align::Left);
+    ui.text("任天堂：对调 A/B 和 X/Y", ix, y + 276.0, 28.0, DIM, false, Align::Left);
     let bw = (iw - 16.0) / 2.0;
-    ui.button(Hit::Nintendo(false), ix, y + 136.0, bw, 100.0, "Xbox", 40.0, !s.nintendo, ACCENT);
-    ui.button(Hit::Nintendo(true), ix + bw + 16.0, y + 136.0, bw, 100.0, "任天堂", 40.0, s.nintendo, ACCENT);
-    ui.switch(Hit::Rumble, ix, y + 270.0, iw, "震动", "游戏的震动传到掌机", s.rumble);
-    ui.text("触控板速度", ix, y + 470.0, 42.0, TEXT, true, Align::Left);
-    let sw = (iw - 32.0) / 3.0;
-    for (i, (label, pct)) in [("慢", 100), ("中", 160), ("快", 240)].into_iter().enumerate() {
-        let bx = ix + i as f32 * (sw + 16.0);
-        ui.button(Hit::PointerSpeed(pct), bx, y + 500.0, sw, 100.0, label, 40.0, s.pointer_speed == pct, ACCENT);
-    }
+    ui.button(Hit::Nintendo(false), ix, y + 300.0, bw, 100.0, "Xbox", 40.0, !s.nintendo, ACCENT);
+    ui.button(Hit::Nintendo(true), ix + bw + 16.0, y + 300.0, bw, 100.0, "任天堂", 40.0, s.nintendo, ACCENT);
+    ui.switch(Hit::Rumble, ix, y + 450.0, iw, "震动", "游戏的震动传到掌机", s.rumble);
 
     let x = M + w + 24.0;
     ui.card(x, y, w, h);
     let (ix, iw) = (x + 36.0, w - 72.0);
-    ui.switch(Hit::Audio, ix, y + 26.0, iw, "主机声音", "插上耳机时传来电脑的声音", s.audio);
-    ui.switch(Hit::Mic, ix, y + 186.0, iw, "耳机麦克风", "当作电脑的麦克风", s.mic);
-    ui.text("音频缓冲", ix, y + 400.0, 42.0, TEXT, true, Align::Left);
-    ui.text("越小延迟越低，有杂音就调大", ix, y + 446.0, 28.0, DIM, false, Align::Left);
+    if v.bluetooth {
+        ui.text("Home 组合键", ix, y + 66.0, 42.0, TEXT, true, Align::Left);
+        let lines = [
+            "Home + A / B / X / Y　回放宏 1–4",
+            "Home + ↓　熄屏 / 唤醒",
+            "长按 Home + Select　退出",
+        ];
+        for (i, l) in lines.into_iter().enumerate() {
+            ui.text(l, ix, y + 140.0 + i as f32 * 60.0, 34.0, DIM, false, Align::Left);
+        }
+        return;
+    }
+    ui.switch(Hit::Audio, ix, y + 20.0, iw, "主机声音", "插上耳机时传来电脑的声音", s.audio);
+    ui.switch(Hit::Mic, ix, y + 160.0, iw, "耳机麦克风", "当作电脑的麦克风", s.mic);
+    ui.text("音频缓冲", ix, y + 352.0, 40.0, TEXT, true, Align::Left);
     let lw = (iw - 48.0) / 4.0;
     for (i, ms) in [20, 30, 45, 60].into_iter().enumerate() {
         let bx = ix + i as f32 * (lw + 16.0);
-        ui.button(Hit::Latency(ms), bx, y + 476.0, lw, 100.0, &format!("{ms}ms"), 38.0, s.audio_latency_ms == ms, ACCENT);
+        ui.button(Hit::Latency(ms), bx, y + 376.0, lw, 92.0, &format!("{ms}ms"), 36.0, s.audio_latency_ms == ms, ACCENT);
     }
-    ui.text("Home 组合键：A/B/X/Y 宏 · LB/RB 音量 · Start 截图 · ↓ 熄屏", ix, y + h - 36.0, 26.0, DIM, false, Align::Left);
+    ui.text("触控板速度", ix, y + 540.0, 40.0, TEXT, true, Align::Left);
+    let sw = (iw - 32.0) / 3.0;
+    for (i, (label, pct)) in [("慢", 100), ("中", 160), ("快", 240)].into_iter().enumerate() {
+        let bx = ix + i as f32 * (sw + 16.0);
+        ui.button(Hit::PointerSpeed(pct), bx, y + 564.0, sw, 92.0, label, 38.0, s.pointer_speed == pct, ACCENT);
+    }
 }
 
 fn controller(ui: &mut Ui, p: &Pad, w: f32) {

@@ -10,8 +10,30 @@ pub const MACRO_SLOTS: usize = 4;
 pub const TURBO_LT: u32 = 1 << 20;
 pub const TURBO_RT: u32 = 1 << 21;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Wifi,
+    Bluetooth,
+}
+
+/// Bluetooth address as text ("AA:BB:CC:DD:EE:FF"), fixed size so Settings stays Copy.
+pub type Addr = [u8; 17];
+
+pub fn addr_str(a: &Addr) -> &str {
+    std::str::from_utf8(a).unwrap_or("")
+}
+
+pub fn parse_addr(s: &str) -> Option<Addr> {
+    let b = s.trim().as_bytes();
+    (b.len() == 17).then(|| b.try_into().unwrap())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
+    pub mode: Mode,
+    /// Bluetooth host to connect to; None = whichever paired host comes first.
+    pub bt_target: Option<Addr>,
     /// Swap A/B and X/Y (buttons labelled like a Nintendo pad).
     pub nintendo: bool,
     pub rumble: bool,
@@ -29,7 +51,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { nintendo: false, rumble: true, audio: true, mic: true, audio_latency_ms: 30, turbo: 0, turbo_hz: 15, pointer_speed: 160 }
+        Self { mode: Mode::Wifi, bt_target: None, nintendo: false, rumble: true, audio: true, mic: true, audio_latency_ms: 30, turbo: 0, turbo_hz: 15, pointer_speed: 160 }
     }
 }
 
@@ -47,6 +69,8 @@ impl Settings {
             let b = v == "true";
             let n = v.parse::<u32>().ok();
             match k {
+                "mode" => s.mode = if v == "bluetooth" { Mode::Bluetooth } else { Mode::Wifi },
+                "bt_target" => s.bt_target = parse_addr(v),
                 "nintendo" => s.nintendo = b,
                 "rumble" => s.rumble = b,
                 "audio" => s.audio = b,
@@ -63,7 +87,9 @@ impl Settings {
 
     pub fn save(&self) {
         let text = format!(
-            "nintendo={}\nrumble={}\naudio={}\nmic={}\naudio_latency_ms={}\nturbo={}\nturbo_hz={}\npointer_speed={}\n",
+            "mode={}\nbt_target={}\nnintendo={}\nrumble={}\naudio={}\nmic={}\naudio_latency_ms={}\nturbo={}\nturbo_hz={}\npointer_speed={}\n",
+            if self.mode == Mode::Bluetooth { "bluetooth" } else { "wifi" },
+            self.bt_target.as_ref().map_or("", addr_str),
             self.nintendo,
             self.rumble,
             self.audio,
@@ -147,6 +173,13 @@ pub fn save_macros(m: &[Macro; MACRO_SLOTS]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addr_roundtrip() {
+        let a = parse_addr("12:34:56:78:9A:BC").unwrap();
+        assert_eq!(addr_str(&a), "12:34:56:78:9A:BC");
+        assert!(parse_addr("nope").is_none());
+    }
 
     #[test]
     fn macro_lookup() {

@@ -11,8 +11,8 @@ use evdev::{EventType, InputEvent};
 use flipad_proto::Pad;
 
 use crate::ble::Peripheral;
-use crate::link::{Cmd, Motor, Phase, Shared, View, apply_event};
-use crate::settings::{load_macros, save_macros};
+use crate::link::{BtHost, Cmd, Motor, Phase, Shared, View, apply_event};
+use crate::settings::{Addr, Mode, addr_str, load_macros, parse_addr, save_macros};
 use crate::shaper::{Event, Shaper};
 
 fn battery() -> u8 {
@@ -22,7 +22,29 @@ fn battery() -> u8 {
         .unwrap_or(100)
 }
 
-pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::Result<()> {
+fn hosts_file() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/flipad/bt-hosts")
+}
+
+/// Hosts that have used this controller over Bluetooth: "ADDR<TAB>name" lines.
+pub fn load_hosts() -> Vec<(Addr, String)> {
+    std::fs::read_to_string(hosts_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (a, n) = l.split_once('\t').unwrap_or((l, ""));
+            Some((parse_addr(a)?, n.to_string()))
+        })
+        .collect()
+}
+
+fn save_hosts(h: &[(Addr, String)]) {
+    let text: String = h.iter().map(|(a, n)| format!("{}\t{n}\n", addr_str(a))).collect();
+    let _ = std::fs::write(hosts_file(), text);
+}
+
+/// Runs until quit or until the panel switches to Wi-Fi.
+pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io::Result<()> {
     let ble = match Peripheral::start(battery()) {
         Ok(p) => p,
         Err(e) => {
@@ -38,6 +60,9 @@ pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::R
     let mut last_poll = Instant::now() - Duration::from_secs(10);
     let mut last_battery = Instant::now();
     let mut was_subscribed = false;
+    let mut hosts = load_hosts();
+    let mut target = shared.settings.lock().unwrap().bt_target;
+    ble.apply_target(target.as_ref(), &hosts.iter().map(|h| h.0).collect::<Vec<_>>());
     let publish = |shaper: &Shaper, v: &mut View| {
         v.macros = std::array::from_fn(|i| (!shaper.macros[i].steps.is_empty()).then(|| shaper.macros[i].length()));
         v.recording = shaper.recording();
@@ -52,6 +77,14 @@ pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::R
     while !shared.quit.load(Ordering::Relaxed) {
         let now = Instant::now();
         let settings = *shared.settings.lock().unwrap();
+        if settings.mode != Mode::Bluetooth {
+            break;
+        }
+        if settings.bt_target != target {
+            target = settings.bt_target;
+            ble.apply_target(target.as_ref(), &hosts.iter().map(|h| h.0).collect::<Vec<_>>());
+            last_poll = now - Duration::from_secs(10);
+        }
         let wait = shaper
             .deadline(&settings, now)
             .map_or(250, |d| d.saturating_duration_since(now).as_millis().clamp(1, 250) as i32);
@@ -81,7 +114,7 @@ pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::R
         let mut macros_changed = false;
         for c in std::mem::take(&mut *shared.cmds.lock().unwrap()) {
             match c {
-                Cmd::Action(_) => {}
+                Cmd::Action(_) | Cmd::PluginButton(_) => {}
                 Cmd::Record(i) => shaper.start_recording(i, now),
                 Cmd::StopRecording => macros_changed |= shaper.stop_recording(now).is_some(),
                 Cmd::Play(i) => shaper.play(i, now),
@@ -121,14 +154,30 @@ pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::R
 
         while let Ok(r) = ble.rumble.try_recv() {
             if settings.rumble {
-                motor.play(&mut dev, r.strong, r.weak, r.ms);
+                motor.play(dev, r.strong, r.weak, r.ms);
                 shared.update(|v| v.rumble = r.strong > 0 || r.weak > 0);
             }
         }
 
         if now.duration_since(last_poll) >= Duration::from_secs(1) {
             last_poll = now;
-            let host = ble.connected_host();
+            // remember every host that uses us, for the switcher
+            if let Some((addr, name)) = ble.peer() {
+                match hosts.iter_mut().find(|h| h.0 == addr) {
+                    Some(h) if h.1 != name => {
+                        h.1 = name;
+                        save_hosts(&hosts);
+                    }
+                    Some(_) => {}
+                    None => {
+                        hosts.push((addr, name));
+                        save_hosts(&hosts);
+                    }
+                }
+            }
+            let list: Vec<BtHost> =
+                hosts.iter().map(|(a, n)| BtHost { addr: *a, name: n.clone(), connected: ble.is_connected(a) }).collect();
+            let host = list.iter().find(|h| h.connected).map(|h| h.name.clone());
             let phase = match (&host, subscribed) {
                 (Some(_), true) => Phase::Connected,
                 (Some(_), false) => Phase::Connecting,
@@ -137,6 +186,7 @@ pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::R
             shared.update(|v| {
                 v.phase = phase;
                 v.host = host.unwrap_or_default();
+                v.bt_hosts = list;
             });
         }
         if now.duration_since(last_battery) >= Duration::from_secs(30) {
@@ -166,6 +216,6 @@ pub fn run(mut dev: RawDevice, wake: OwnedFd, shared: Arc<Shared>) -> std::io::R
     if ble.subscribed() {
         ble.send(&Pad::default());
     }
-    motor.play(&mut dev, 0, 0, 0);
+    motor.play(dev, 0, 0, 0);
     Ok(())
 }

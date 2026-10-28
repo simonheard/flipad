@@ -4,6 +4,7 @@ mod audio;
 mod keys;
 mod mouse;
 mod pad;
+mod plugins;
 mod stats;
 
 use std::net::{SocketAddr, UdpSocket};
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use flipad_proto::{HostAction, Msg, PORT, Pad, TOKEN_LEN, parse_token, seq_newer};
+use flipad_proto::{Msg, PORT, Pad, TOKEN_LEN, parse_token, seq_newer};
 use pad::VirtualPad;
 
 /// No packets for this long: release everything so nothing stays held.
@@ -103,13 +104,18 @@ fn main() -> std::io::Result<()> {
         signal_hook::flag::register(sig, quit.clone())?;
     }
     let audio = audio::Audio::start();
-    let (keys_tx, keys_rx) = std::sync::mpsc::channel::<HostAction>();
+    let (keys_tx, keys_rx) = std::sync::mpsc::channel::<keys::KeyJob>();
     std::thread::spawn(move || {
         let mut keys = keys::Keys::new();
-        while let Ok(a) = keys_rx.recv() {
-            keys.run(a);
+        while let Ok(job) = keys_rx.recv() {
+            keys.run(job);
         }
     });
+    let (plugin_tx, plugin_rx) = std::sync::mpsc::channel::<(String, u16)>();
+    {
+        let (sock, peer, keys) = (sock.try_clone()?, peer.clone(), keys_tx.clone());
+        std::thread::Builder::new().name("plugins".into()).spawn(move || plugins::run(sock, peer, keys, plugin_rx))?;
+    }
 
     let mut mouse = mouse::Mouse::new().map_err(|e| eprintln!("virtual mouse: {e}")).ok();
     let mut session: Option<Session> = None;
@@ -126,7 +132,7 @@ fn main() -> std::io::Result<()> {
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
                 let Some(msg) = Msg::decode(&buf[..n]) else { continue };
                 let had_session = session.is_some();
-                handle(&sock, &mut session, &peer, &audio, &keys_tx, mouse.as_mut(), &token, &name, msg, from, now);
+                handle(&sock, &mut session, &peer, &audio, &keys_tx, &plugin_tx, mouse.as_mut(), &token, &name, msg, from, now);
                 if had_session && session.is_none() && let Some(m) = &mut mouse {
                     m.release();
                 }
@@ -164,7 +170,8 @@ fn handle(
     session: &mut Option<Session>,
     peer: &Mutex<Option<SocketAddr>>,
     audio: &audio::Audio,
-    keys: &std::sync::mpsc::Sender<HostAction>,
+    keys: &std::sync::mpsc::Sender<keys::KeyJob>,
+    plugins: &std::sync::mpsc::Sender<(String, u16)>,
     mouse: Option<&mut mouse::Mouse>,
     token: &[u8; TOKEN_LEN],
     name: &str,
@@ -239,6 +246,12 @@ fn handle(
                 }
             }
         }
+        Msg::PluginButton { session: id, plugin, id: button } => {
+            if let Some(s) = session.as_mut().filter(|s| ours(s, id)) {
+                s.last_seen = now;
+                let _ = plugins.send((plugin, button));
+            }
+        }
         Msg::Action { session: id, id: action_id, action } => {
             if let Some(s) = session.as_mut().filter(|s| ours(s, id)) {
                 s.last_seen = now;
@@ -248,7 +261,7 @@ fn handle(
                     }
                     s.actions.push(action_id);
                     eprintln!("{}: {action:?}", s.name);
-                    let _ = keys.send(action);
+                    let _ = keys.send(keys::KeyJob::Action(action));
                 }
             }
         }
