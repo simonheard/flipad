@@ -18,6 +18,7 @@ mod shaper;
 mod touch;
 mod sleep;
 mod ui;
+mod videogen;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -87,6 +88,14 @@ fn main() {
                 let out = args.next().unwrap_or_else(|| "flipad-preview.png".into());
                 if let Err(e) = ui::preview(&out) {
                     eprintln!("{e}");
+                }
+                return;
+            }
+            "--make-video" => {
+                let dir = args.next().unwrap_or_else(|| ".".into());
+                if let Err(e) = videogen::make(&dir, args.next().as_deref()) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
                 }
                 return;
             }
