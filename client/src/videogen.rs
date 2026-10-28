@@ -588,6 +588,8 @@ fn scene_intro(st: &mut Studio, pm: &mut Pixmap, t: f32) {
     device(st, pm, Shot { screen: &scr, pose, tilt: (ax, ay), alpha: fade(t, 0.0, 0.7), power: fade(t, 1.5, 0.15), flash, mix: 1.0 });
     let a = fade(t, 2.0, 0.6) * (1.0 - fade(t, 4.8, 0.5));
     text(st, pm, "你的掌机，也可以是电脑的手柄。", W as f32 / 2.0, 140.0 - (1.0 - fade(t, 2.0, 0.6)) * 30.0, 60.0, TEXT, a, true, Align::Center);
+    let b = fade(t, 2.6, 0.6) * (1.0 - fade(t, 4.8, 0.5));
+    text(st, pm, "Retroid Pocket Flip 2 · 已刷 Linux（Pocknix），不是原厂安卓", W as f32 / 2.0, 205.0, 34.0, ACCENT, b, true, Align::Center);
 }
 
 fn scene_controller(st: &mut Studio, pm: &mut Pixmap, t: f32) {
@@ -792,8 +794,9 @@ fn scene_end(st: &mut Studio, pm: &mut Pixmap, t: f32) {
     }
     let a = fade(t, 0.8, 0.7);
     text(st, pm, "Flip Pad", W as f32 / 2.0, 500.0 + (1.0 - a) * 40.0, 150.0, TEXT, a, true, Align::Center);
-    text(st, pm, "开源 · Rust · MIT", W as f32 / 2.0, 600.0, 44.0, ACCENT, fade(t, 1.3, 0.6), true, Align::Center);
+    text(st, pm, "开源 · Rust · MIT · 不是教程，纯分享", W as f32 / 2.0, 600.0, 44.0, ACCENT, fade(t, 1.3, 0.6), true, Align::Center);
     text(st, pm, "github.com/simonheard/flipad", W as f32 / 2.0, 710.0, 52.0, TEXT, fade(t, 1.8, 0.6), false, Align::Center);
+    text(st, pm, "有需求欢迎提 PR", W as f32 / 2.0, 790.0, 36.0, DIM, fade(t, 2.0, 0.6), false, Align::Center);
     text(st, pm, "产品图片来自 Retroid 官网", W as f32 / 2.0, 1030.0, 24.0, DIM, fade(t, 2.2, 0.6), false, Align::Center);
 }
 
