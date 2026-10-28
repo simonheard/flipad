@@ -1,4 +1,10 @@
-"""Minimal CDP client (stdlib only): evaluates JS in Steam's SharedJSContext."""
+"""Minimal CDP client (stdlib only) for Steam's SharedJSContext.
+
+Run on the handheld while Steam is running (it listens on 127.0.0.1:8080):
+
+    python3 steam-cdp.py < script.js            # evaluate JavaScript
+    python3 steam-cdp.py add-shortcut NAME EXE [START_DIR]
+"""
 import base64, json, os, socket, struct, sys, urllib.request
 
 def target():
@@ -46,5 +52,21 @@ def evaluate(js):
         if m.get("id") == 1:
             return m["result"]
 
+def add_shortcut(name, exe, start_dir):
+    q = lambda p: json.dumps('"' + p + '"')  # Steam stores paths quoted
+    js = f"""(async () => {{
+      const id = await SteamClient.Apps.AddShortcut({json.dumps(name)}, {q(exe)}, {q(start_dir)}, "");
+      // set again: AddShortcut sometimes double-quotes the path
+      SteamClient.Apps.SetShortcutName(id, {json.dumps(name)});
+      SteamClient.Apps.SetShortcutExe(id, {q(exe)});
+      SteamClient.Apps.SetShortcutStartDir(id, {q(start_dir)});
+      return id;
+    }})()"""
+    return evaluate(js)
+
 if __name__ == "__main__":
-    print(json.dumps(evaluate(sys.stdin.read()), ensure_ascii=False))
+    if len(sys.argv) >= 4 and sys.argv[1] == "add-shortcut":
+        start = sys.argv[4] if len(sys.argv) > 4 else os.path.dirname(sys.argv[3])
+        print(json.dumps(add_shortcut(sys.argv[2], sys.argv[3], start), ensure_ascii=False))
+    else:
+        print(json.dumps(evaluate(sys.stdin.read()), ensure_ascii=False))

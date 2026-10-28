@@ -418,7 +418,7 @@ pub fn preview(path: &str) -> Result<(), String> {
         bluetooth: true,
         host: "MY-DESKTOP".into(),
         rtt_ms: None,
-        bt_hosts: vec![host("12:34:56:78:9A:BC", "my-desktop", true), host("AA:BB:CC:DD:EE:01", "iPad", false)],
+        bt_hosts: vec![host("11:22:33:44:55:66", "my-desktop", true), host("AA:BB:CC:DD:EE:01", "iPad", false)],
         ..view.clone()
     };
     let game_view = View {

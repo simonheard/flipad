@@ -5,6 +5,9 @@ members = ["proto", "host", "client"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/simonheard/flipad"
+description = "Turn a Linux handheld (Retroid Pocket Flip 2) into a wireless controller, touchpad, headset and game panel for your PC"
 
 [profile.release]
 opt-level = 3
