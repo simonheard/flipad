@@ -125,6 +125,7 @@ fn main() {
         }),
         cmds: Mutex::default(),
         pointer: Mutex::default(),
+        pair_request: AtomicBool::new(false),
         frames: Mutex::default(),
         wake: wake_w,
         notify: Box::new(move || {

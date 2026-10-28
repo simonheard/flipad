@@ -73,6 +73,8 @@ pub struct App {
     raw_prev: Vec<crate::touch::Contact>,
     raw_prev_at: Instant,
     switcher: bool,
+    /// A host whose "forget" button was tapped once (tap again to confirm).
+    forget_armed: Option<crate::settings::Addr>,
     last_touch: Option<Instant>,
     dirty: bool,
     last_draw: Instant,
@@ -101,6 +103,7 @@ impl App {
             raw_prev: Vec::new(),
             raw_prev_at: Instant::now(),
             switcher: false,
+            forget_armed: None,
             last_touch: None,
             dirty: true,
             last_draw: Instant::now() - FRAME,
@@ -323,7 +326,10 @@ impl App {
             Hit::PointerSpeed(p) => set(&|s| s.pointer_speed = p),
             Hit::Output(o) => set(&|s| s.output = o),
             Hit::OpenSwitcher => self.switcher = true,
-            Hit::CloseSwitcher => self.switcher = false,
+            Hit::CloseSwitcher => {
+                self.switcher = false;
+                self.forget_armed = None;
+            }
             Hit::Connect(t) => {
                 set(&|s| match t {
                     Target::Wifi => s.mode = Mode::Wifi,
@@ -340,6 +346,28 @@ impl App {
                 sh.poke_pub();
             }
             Hit::PluginButton(id) => sh.command(Cmd::PluginButton(id)),
+            Hit::PairNew => {
+                // pairing happens in Bluetooth mode; switch there if needed
+                let bt = sh.settings.lock().unwrap().mode == Mode::Bluetooth;
+                if bt {
+                    sh.command(Cmd::Pairing(true));
+                } else {
+                    sh.pair_request.store(true, std::sync::atomic::Ordering::Relaxed);
+                    set(&|s| s.mode = Mode::Bluetooth);
+                    sh.poke_pub();
+                }
+                self.switcher = false;
+            }
+            Hit::StopPairing => sh.command(Cmd::Pairing(false)),
+            Hit::Forget(a) => {
+                if self.forget_armed == Some(a) {
+                    sh.command(Cmd::Forget(a));
+                    self.forget_armed = None;
+                } else {
+                    // ask for a second tap before removing a pairing
+                    self.forget_armed = Some(a);
+                }
+            }
             Hit::Pad | Hit::ScrollStrip => {}
             Hit::Exit => self.quit(el),
             Hit::ScreenOff => sh.update(|v| v.screen_off = true),
@@ -398,6 +426,7 @@ impl App {
                 fingers,
                 switcher: self.switcher,
                 frames: &frames,
+                forget_armed: self.forget_armed,
             };
             panel::render(&mut ui, &view, &settings, self.tab, self.battery);
         }
@@ -565,6 +594,7 @@ pub fn preview(path: &str) -> Result<(), String> {
         bt_hosts: vec![],
         wifi_host: "my-desktop".into(),
         plugin: None,
+        pairing_left: None,
     };
     let settings = Settings { turbo: button::SOUTH | crate::settings::TURBO_RT, ..Settings::default() };
     let bt_settings = Settings { mode: Mode::Bluetooth, ..settings };
@@ -614,7 +644,8 @@ pub fn preview(path: &str) -> Result<(), String> {
         (Tab::Overview, View { screen_off: true, ..view.clone() }, settings, false),
         (Tab::Overview, bt_view.clone(), bt_settings, false),
         (Tab::Settings, bt_view.clone(), bt_settings, false),
-        (Tab::Overview, bt_view, bt_settings, true),
+        (Tab::Overview, bt_view.clone(), bt_settings, true),
+        (Tab::Overview, View { pairing_left: Some(42), ..bt_view }, bt_settings, false),
     ];
     let mut sheet = Pixmap::new(1920, 1080 * pages.len() as u32).unwrap();
     for (i, (tab, v, st, switcher)) in pages.into_iter().enumerate() {
@@ -631,6 +662,7 @@ pub fn preview(path: &str) -> Result<(), String> {
             fingers: 0,
             switcher,
             frames: &frames,
+            forget_armed: None,
         };
         panel::render(&mut ui, &v, &st, tab, (Some(76), false));
         sheet.draw_pixmap(0, (i * 1080) as i32, cv.pm.as_ref(), &Default::default(), Default::default(), None);

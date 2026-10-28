@@ -39,6 +39,24 @@ pub fn load_hosts() -> Vec<(Addr, String)> {
         .collect()
 }
 
+/// Removes a host from the list and its pairing from BlueZ (works in either mode).
+pub fn forget_host(addr: &Addr) {
+    let mut hosts = load_hosts();
+    hosts.retain(|h| h.0 != *addr);
+    save_hosts(&hosts);
+    let path = format!("/org/bluez/hci0/dev_{}", addr_str(addr).replace(':', "_"));
+    if let Ok(conn) = zbus::blocking::Connection::system()
+        && let Ok(p) = zbus::blocking::Proxy::new(&conn, "org.bluez", "/org/bluez/hci0", "org.bluez.Adapter1")
+        && let Ok(dev) = zbus::zvariant::ObjectPath::try_from(path.as_str())
+    {
+        let _ = p.call_method("RemoveDevice", &(&dev,));
+    }
+    eprintln!("bluetooth: forgot {}", addr_str(addr));
+}
+
+/// How long the pairing window stays open.
+const PAIRING_WINDOW: Duration = Duration::from_secs(60);
+
 fn save_hosts(h: &[(Addr, String)]) {
     let text: String = h.iter().map(|(a, n)| format!("{}\t{n}\n", addr_str(a))).collect();
     let _ = std::fs::write(hosts_file(), text);
@@ -70,6 +88,16 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
     let mut audio_asked: Option<crate::settings::Addr> = None;
     let mut hosts = load_hosts();
     let mut target = shared.settings.lock().unwrap().bt_target;
+    // first time with no paired host: open the pairing window right away
+    let mut pairing_until: Option<Instant> = None;
+    if hosts.is_empty() {
+        ble.set_pairing(true);
+        pairing_until = Some(Instant::now() + PAIRING_WINDOW);
+    }
+    if shared.pair_request.swap(false, Ordering::Relaxed) && pairing_until.is_none() {
+        ble.set_pairing(true);
+        pairing_until = Some(Instant::now() + PAIRING_WINDOW);
+    }
     ble.apply_target(target.as_ref(), &hosts.iter().map(|h| h.0).collect::<Vec<_>>());
     let publish = |shaper: &Shaper, v: &mut View| {
         v.macros = std::array::from_fn(|i| (!shaper.macros[i].steps.is_empty()).then(|| shaper.macros[i].length()));
@@ -179,6 +207,17 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
             match c {
                 Cmd::Action(a) => run_shortcut(a),
                 Cmd::PluginButton(_) => {}
+                Cmd::Pairing(on) => {
+                    ble.set_pairing(on);
+                    pairing_until = on.then(|| now + PAIRING_WINDOW);
+                    last_poll = now - Duration::from_secs(10);
+                }
+                Cmd::Forget(addr) => {
+                    ble.forget(&addr);
+                    forget_host(&addr);
+                    hosts.retain(|h| h.0 != addr);
+                    last_poll = now - Duration::from_secs(10);
+                }
                 Cmd::Record(i) => shaper.start_recording(i, now),
                 Cmd::StopRecording => macros_changed |= shaper.stop_recording(now).is_some(),
                 Cmd::Play(i) => shaper.play(i, now),
@@ -234,8 +273,14 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
                     }
                     Some(_) => {}
                     None => {
+                        eprintln!("bluetooth: new host {name} ({})", addr_str(&addr));
+                        ble.trust(&addr);
                         hosts.push((addr, name));
                         save_hosts(&hosts);
+                        // paired: no need to keep the window open
+                        if pairing_until.take().is_some() {
+                            ble.set_pairing(false);
+                        }
                     }
                 }
             }
@@ -257,10 +302,16 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
                 (Some(_), false) => Phase::Connecting,
                 _ => Phase::Searching,
             };
+            if pairing_until.is_some_and(|t| now >= t) {
+                pairing_until = None;
+                ble.set_pairing(false);
+            }
+            let left = pairing_until.map(|t| t.saturating_duration_since(now).as_secs() as u32);
             shared.update(|v| {
                 v.phase = phase;
                 v.host = host.unwrap_or_default();
                 v.bt_hosts = list;
+                v.pairing_left = left;
             });
         }
         if now.duration_since(last_battery) >= Duration::from_secs(30) {
@@ -287,6 +338,7 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
         save_macros(&shaper.macros);
     }
     // release everything before going away so nothing stays held on the host
+    shared.update(|v| v.pairing_left = None);
     if ble.subscribed() {
         ble.send(&Pad::default());
         ble.send_mouse(0, 0, 0, 0, 0);

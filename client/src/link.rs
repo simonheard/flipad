@@ -67,6 +67,8 @@ pub struct View {
     pub wifi_host: String,
     /// The active game plugin's panel on the host, if any.
     pub plugin: Option<PluginPanel>,
+    /// Bluetooth pairing window: seconds left while open.
+    pub pairing_left: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +104,10 @@ pub enum Cmd {
     Play(usize),
     Clear(usize),
     PluginButton(u16),
+    /// Bluetooth: open (true) or close the pairing window.
+    Pairing(bool),
+    /// Bluetooth: remove a host's pairing.
+    Forget(Addr),
 }
 
 pub struct Shared {
@@ -111,6 +117,9 @@ pub struct Shared {
     pub settings: Mutex<Settings>,
     pub cmds: Mutex<Vec<Cmd>>,
     pub pointer: Mutex<Vec<PointerOp>>,
+    /// Set by the panel to open the Bluetooth pairing window once
+    /// Bluetooth mode is (or becomes) active.
+    pub pair_request: AtomicBool,
     /// Latest decoded image per plugin image widget.
     pub frames: Mutex<std::collections::HashMap<u16, Arc<Pixmap>>>,
     /// Write end of a pipe the forwarding loop polls, to act on panel input
@@ -391,6 +400,11 @@ fn serve(
                 Cmd::Clear(i) => {
                     shaper.clear(i);
                     macros_changed = true;
+                }
+                Cmd::Pairing(_) => {}
+                Cmd::Forget(addr) => {
+                    crate::btlink::forget_host(&addr);
+                    shared.update(|v| v.bt_hosts.retain(|h| h.addr != addr));
                 }
                 Cmd::PluginButton(id) => {
                     let plugin = shared.view.lock().unwrap().plugin.as_ref().map(|p| p.plugin.clone());

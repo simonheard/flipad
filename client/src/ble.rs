@@ -306,7 +306,11 @@ impl Desc {
     }
 }
 
-struct Advertisement;
+/// Our advertisement. Bonded hosts reconnect to it either way; while
+/// `discoverable` is off, it does not show up when someone searches.
+struct Advertisement {
+    discoverable: Arc<AtomicBool>,
+}
 
 #[interface(name = "org.bluez.LEAdvertisement1")]
 impl Advertisement {
@@ -328,25 +332,43 @@ impl Advertisement {
     }
     #[zbus(property)]
     fn discoverable(&self) -> bool {
-        true
+        self.discoverable.load(Ordering::Relaxed)
     }
     fn release(&self) {}
 }
 
-/// Accepts every pairing: there is no keyboard or code display to confirm with.
-struct Agent;
+/// Pairing agent. There is no keyboard or code display to confirm with, so
+/// it accepts pairing, but only while the user has opened a pairing window.
+struct Agent {
+    pairing: Arc<AtomicBool>,
+}
+
+impl Agent {
+    fn allow(&self) -> zbus::fdo::Result<()> {
+        if self.pairing.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            Err(zbus::fdo::Error::AccessDenied("not in pairing mode".into()))
+        }
+    }
+}
 
 #[interface(name = "org.bluez.Agent1")]
 impl Agent {
     fn release(&self) {}
-    fn request_authorization(&self, _device: OwnedObjectPath) {}
-    fn authorize_service(&self, _device: OwnedObjectPath, _uuid: String) {}
-    fn request_confirmation(&self, _device: OwnedObjectPath, _passkey: u32) {}
-    fn request_pin_code(&self, _device: OwnedObjectPath) -> String {
-        "0000".into()
+    fn request_authorization(&self, _device: OwnedObjectPath) -> zbus::fdo::Result<()> {
+        self.allow()
     }
-    fn request_passkey(&self, _device: OwnedObjectPath) -> u32 {
-        0
+    // services of an already paired host (e.g. its audio) are always fine
+    fn authorize_service(&self, _device: OwnedObjectPath, _uuid: String) {}
+    fn request_confirmation(&self, _device: OwnedObjectPath, _passkey: u32) -> zbus::fdo::Result<()> {
+        self.allow()
+    }
+    fn request_pin_code(&self, _device: OwnedObjectPath) -> zbus::fdo::Result<String> {
+        self.allow().map(|_| "0000".into())
+    }
+    fn request_passkey(&self, _device: OwnedObjectPath) -> zbus::fdo::Result<u32> {
+        self.allow().map(|_| 0)
     }
     fn display_passkey(&self, _device: OwnedObjectPath, _passkey: u32, _entered: u16) {}
     fn display_pin_code(&self, _device: OwnedObjectPath, _code: String) {}
@@ -368,6 +390,12 @@ pub struct Peripheral {
     extras: Vec<(&'static str, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>)>,
     /// Adapter's classic-BT connectability before we opened it for audio.
     was_connectable: Option<bool>,
+    /// Pairing window state, shared with the agent and the advertisement.
+    pairing: Arc<AtomicBool>,
+    discoverable: Arc<AtomicBool>,
+    /// Adapter Pairable / Discoverable before we started.
+    was_pairable: Option<bool>,
+    was_discoverable: Option<bool>,
 }
 
 fn adapter(conn: &Connection, iface: &'static str) -> zbus::Result<Proxy<'static>> {
@@ -521,8 +549,10 @@ impl Peripheral {
                 peer: peer.clone(),
             },
         )?;
-        os.at(ADV, Advertisement)?;
-        os.at(AGENT, Agent)?;
+        let pairing = Arc::new(AtomicBool::new(false));
+        let discoverable = Arc::new(AtomicBool::new(false));
+        os.at(ADV, Advertisement { discoverable: discoverable.clone() })?;
+        os.at(AGENT, Agent { pairing: pairing.clone() })?;
 
         // the GAP name hosts show after connecting
         let props = zbus::blocking::fdo::PropertiesProxy::builder(&conn).destination("org.bluez")?.path("/org/bluez/hci0")?.build()?;
@@ -537,7 +567,11 @@ impl Peripheral {
         }
         let _ = props.set("org.bluez.Adapter1".try_into()?, "Alias", Value::from(NAME));
         let _ = props.set("org.bluez.Adapter1".try_into()?, "Powered", Value::from(true));
-        let _ = props.set("org.bluez.Adapter1".try_into()?, "Pairable", Value::from(true));
+        let get_bool = |name: &str| -> Option<bool> {
+            props.get("org.bluez.Adapter1".try_into().ok()?, name).ok().and_then(|v| bool::try_from(v).ok())
+        };
+        let (was_pairable, was_discoverable) = (get_bool("Pairable"), get_bool("Discoverable"));
+
         // accept classic connections too, so the host can stream audio (A2DP)
         let was_connectable: Option<bool> =
             props.get("org.bluez.Adapter1".try_into()?, "Connectable").ok().and_then(|v| bool::try_from(v).ok());
@@ -554,6 +588,9 @@ impl Peripheral {
         adapter(&conn, "org.bluez.GattManager1")?.call_method("RegisterApplication", &(ObjectPath::try_from(APP)?, &opts))?;
         adapter(&conn, "org.bluez.LEAdvertisingManager1")?.call_method("RegisterAdvertisement", &(ObjectPath::try_from(ADV)?, &opts))?;
 
+        // no new pairings until the user opens a pairing window; set last,
+        // since registering the agent can turn pairing back on
+        let _ = props.set("org.bluez.Adapter1".try_into()?, "Pairable", Value::from(false));
         drop(os);
         let (rumble_tx, rumble_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -564,7 +601,21 @@ impl Peripheral {
             }
         });
 
-        Ok(Self { conn, input_notifying, input_value, battery, rumble: rumble_rx, peer, blocked: Mutex::default(), extras: extra_values, was_connectable })
+        Ok(Self {
+            conn,
+            input_notifying,
+            input_value,
+            battery,
+            rumble: rumble_rx,
+            peer,
+            blocked: Mutex::default(),
+            extras: extra_values,
+            was_connectable,
+            pairing,
+            discoverable,
+            was_pairable,
+            was_discoverable,
+        })
     }
 
     /// True once a host has subscribed to the input report.
@@ -585,6 +636,56 @@ impl Peripheral {
     fn device(&self, addr: &Addr) -> Option<zbus::blocking::fdo::PropertiesProxy<'static>> {
         let path = format!("/org/bluez/hci0/dev_{}", addr_str(addr).replace(':', "_"));
         zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez").ok()?.path(path).ok()?.build().ok()
+    }
+
+    fn set_adapter(&self, name: &str, value: bool) {
+        if let Ok(b) = zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez")
+            && let Ok(b) = b.path("/org/bluez/hci0")
+            && let Ok(props) = b.build()
+            && let Ok(iface) = "org.bluez.Adapter1".try_into()
+        {
+            let _ = props.set(iface, name, Value::from(value));
+        }
+    }
+
+    /// Opens or closes the pairing window: searchable, and accepting new
+    /// pairings, only while open. Paired hosts can connect either way.
+    pub fn set_pairing(&self, on: bool) {
+        self.pairing.store(on, Ordering::Relaxed);
+        self.discoverable.store(on, Ordering::Relaxed);
+        self.set_adapter("Pairable", on);
+        // LE only: being discoverable over classic BT makes hosts try classic
+        // pairing, which fails here; LE pairing also covers the audio link
+        // advertisement flags are read at registration: register it again
+        if let Ok(p) = adapter(&self.conn, "org.bluez.LEAdvertisingManager1") {
+            let adv = ObjectPath::try_from(ADV).unwrap();
+            let _ = p.call_method("UnregisterAdvertisement", &(&adv,));
+            let opts: HashMap<&str, Value> = HashMap::new();
+            if let Err(e) = p.call_method("RegisterAdvertisement", &(&adv, &opts)) {
+                eprintln!("ble: re-advertise: {e}");
+            }
+        }
+        eprintln!("ble: pairing window {}", if on { "open" } else { "closed" });
+    }
+
+    /// Removes a host's pairing from this handheld.
+    pub fn forget(&self, addr: &Addr) {
+        let path = format!("/org/bluez/hci0/dev_{}", addr_str(addr).replace(':', "_"));
+        if let (Ok(p), Ok(dev)) = (adapter(&self.conn, "org.bluez.Adapter1"), ObjectPath::try_from(path.as_str())) {
+            match p.call_method("RemoveDevice", &(&dev,)) {
+                Ok(_) => eprintln!("ble: forgot {}", addr_str(addr)),
+                Err(e) => eprintln!("ble: forget {}: {e}", addr_str(addr)),
+            }
+        }
+    }
+
+    /// Lets a newly paired host reconnect and use services without asking.
+    pub fn trust(&self, addr: &Addr) {
+        if let Some(p) = self.device(addr)
+            && let Ok(iface) = "org.bluez.Device1".try_into()
+        {
+            let _ = p.set(iface, "Trusted", Value::from(true));
+        }
     }
 
     /// Drops the host's audio stream to us (A2DP) when sound is switched off.
@@ -696,13 +797,14 @@ impl Drop for Peripheral {
         restore_alias();
         let known = std::mem::take(&mut *self.blocked.lock().unwrap());
         self.apply_target(None, &known);
-        if let Some(c) = self.was_connectable
-            && let Ok(b) = zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez")
-            && let Ok(b) = b.path("/org/bluez/hci0")
-            && let Ok(props) = b.build()
-            && let Ok(name) = "org.bluez.Adapter1".try_into()
-        {
-            let _ = props.set(name, "Connectable", Value::from(c));
+        if let Some(c) = self.was_connectable {
+            self.set_adapter("Connectable", c);
+        }
+        if let Some(p) = self.was_pairable {
+            self.set_adapter("Pairable", p);
+        }
+        if let Some(d) = self.was_discoverable {
+            self.set_adapter("Discoverable", d);
         }
         // tell the host right away instead of letting the link time out
         if let Some(dev) = self.peer.lock().unwrap().take()

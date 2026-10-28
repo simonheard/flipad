@@ -95,6 +95,9 @@ pub enum Hit {
     CloseSwitcher,
     Connect(Target),
     PluginButton(u16),
+    PairNew,
+    StopPairing,
+    Forget(Addr),
     /// The touchpad surface; handled as a gesture, not a tap.
     Pad,
     /// Vertical strip that scrolls; also a gesture.
@@ -116,6 +119,8 @@ pub struct Ui<'a> {
     pub fingers: usize,
     pub switcher: bool,
     pub frames: &'a HashMap<u16, Arc<Pixmap>>,
+    /// Host whose "forget" needs a confirming second tap.
+    pub forget_armed: Option<Addr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -278,8 +283,9 @@ fn switcher(ui: &mut Ui, v: &View, s: &Settings) {
     ui.cv.fill(&rrect(0.0, 0.0, W, 1080.0, 0.0), rgba(0x000000, 0.6));
     let mut options = vec![Target::Wifi, Target::BtAuto];
     options.extend(v.bt_hosts.iter().map(|h| Target::Bt(h.addr)));
-    let (w, row) = (1100.0, 112.0);
-    let h = 150.0 + options.len() as f32 * (row + 16.0) + 90.0;
+    let (w, row) = (1100.0, 104.0);
+    // one more row for "pair a new device"
+    let h = 150.0 + (options.len() + 1) as f32 * (row + 16.0) + 70.0;
     let (x, y) = ((W - w) / 2.0, ((1080.0 - h) / 2.0).max(20.0));
     ui.hits.push((Rect { x, y, w, h }, Hit::OpenSwitcher)); // taps on the card keep it open
     ui.card(x, y, w, h);
@@ -297,10 +303,21 @@ fn switcher(ui: &mut Ui, v: &View, s: &Settings) {
         if t == Target::BtAuto {
             label += "（任一已配对设备）";
         }
-        ui.button(Hit::Connect(t), x + 40.0, ry, w - 80.0, row, &label, 38.0, t == cur, ACCENT);
+        if let Target::Bt(a) = t {
+            // a host row also gets a small "forget" button
+            ui.button(Hit::Connect(t), x + 40.0, ry, w - 80.0 - 200.0, row, &label, 36.0, t == cur, ACCENT);
+            let armed = ui.forget_armed == Some(a);
+            ui.button(Hit::Forget(a), x + w - 40.0 - 184.0, ry, 184.0, row, if armed { "确认忘记？" } else { "忘记" }, 30.0, armed, BAD);
+        } else {
+            ui.button(Hit::Connect(t), x + 40.0, ry, w - 80.0, row, &label, 38.0, t == cur, ACCENT);
+        }
     }
-    let hint = "新设备：切到蓝牙后，在电脑或手机的蓝牙设置里配对「Flip Pad」";
-    ui.text(hint, x + 40.0, y + h - 40.0, 28.0, DIM, false, Align::Left);
+    let ry = y + 130.0 + (v.bt_hosts.len() + 2) as f32 * (row + 16.0);
+    let pairing = v.bluetooth && v.pairing_left.is_some();
+    let label = if pairing { format!("配对中…（剩 {} 秒）点此取消", v.pairing_left.unwrap_or(0)) } else { "＋ 配对新设备".into() };
+    ui.button(if pairing { Hit::StopPairing } else { Hit::PairNew }, x + 40.0, ry, w - 80.0, row, &label, 36.0, pairing, GOOD);
+    let hint = "配对时，在电脑或手机的蓝牙设置里选择「Flip Pad」";
+    ui.text(hint, x + 40.0, y + h - 30.0, 26.0, DIM, false, Align::Left);
 }
 
 fn game(ui: &mut Ui, v: &View) {
@@ -358,6 +375,9 @@ fn game(ui: &mut Ui, v: &View) {
 
 fn status_bar(ui: &mut Ui, v: &View, battery: (Option<u8>, bool)) {
     let (dot, label) = match &v.phase {
+        _ if v.bluetooth && v.pairing_left.is_some() => {
+            (ACCENT, format!("蓝牙配对中（剩 {} 秒）", v.pairing_left.unwrap_or(0)))
+        }
         Phase::Searching if v.bluetooth => (WARN, "蓝牙：等待主机连接".to_string()),
         Phase::Connecting if v.bluetooth => (WARN, format!("蓝牙：{} 正在启用手柄", v.host)),
         Phase::Connected if v.bluetooth => (GOOD, format!("蓝牙：{}", v.host)),
@@ -443,6 +463,14 @@ fn bluetooth_info(ui: &mut Ui, v: &View, x: f32, w: f32) {
     let c = if v.phase == Phase::Connected { GOOD } else { WARN };
     ui.text(&state, ix, ty, 34.0, c, true, Align::Left);
     ty += 90.0;
+    if let Some(left) = v.pairing_left {
+        // pairing window open: say what to do, offer to stop
+        ui.cv.fill(&rrect(ix - 16.0, ty - 50.0, w - 48.0, 230.0, 24.0), rgba(ACCENT, 0.12));
+        ui.text(&format!("配对模式，还剩 {left} 秒"), ix, ty, 38.0, ACCENT, true, Align::Left);
+        ui.text("在电脑或手机的蓝牙设置里选择「Flip Pad」", ix, ty + 52.0, 30.0, TEXT, false, Align::Left);
+        ui.button(Hit::StopPairing, ix, ty + 84.0, 220.0, 80.0, "取消", 32.0, false, ACCENT);
+        return;
+    }
     let lines = [
         "第一次使用：在电脑或手机的蓝牙设置里",
         "搜索并配对「Flip Pad」",
