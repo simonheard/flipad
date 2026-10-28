@@ -860,14 +860,14 @@ fn chip(st: &mut Studio, pm: &mut Pixmap, s: &str, x: f32, y: f32) -> f32 {
     w
 }
 
-/// The video cover: the device turned towards the title.
+/// The video cover: the device square on, title on the left.
 fn cover(st: &mut Studio) -> Pixmap {
     let mut pm = Pixmap::new(W, H).unwrap();
     background(&mut pm, 0.0);
     let pad = Pad { buttons: button::SOUTH | button::TR, lx: 20000, ly: -12000, rx: -9000, ry: 6000, lt: 0, rt: 200 };
     let (scr, _) = st.screen("cover", Tab::Overview, &View { pad, ..base_view() }, &Settings::default(), |_| {});
-    let pose = Pose { k: 1.0, x: 1330.0, y: 420.0 };
-    device(st, &mut pm, Shot { screen: &scr, pose, tilt: (0.1, -0.2), alpha: 1.0, power: 1.0, flash: 0.0, mix: 1.0 });
+    let pose = Pose { k: 1.0, x: 1340.0, y: 420.0 };
+    device(st, &mut pm, Shot { screen: &scr, pose, tilt: (0.0, 0.0), alpha: 1.0, power: 1.0, flash: 0.0, mix: 1.0 });
     // keep the left side calm for the title
     if let Some(shader) = tiny_skia::LinearGradient::new(
         tiny_skia::Point::from_xy(560.0, 0.0),
