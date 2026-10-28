@@ -63,7 +63,8 @@
 
 ## 已知限制
 
-- 蓝牙模式没有耳机麦克风（掌机上 HFP 没有启用），也没有主机状态和插件面板。
+- 蓝牙模式没有耳机麦克风：HFP 依赖内核的 RFCOMM，而 Pocknix 内核没有开启 `CONFIG_BT_RFCOMM`（BlueZ 报 `RFCOMM server failed for Hands-Free unit: Protocol not supported`）。需要麦克风请用 Wi-Fi 模式。如果你的系统内核支持 RFCOMM，在 WirePlumber 里开启 `hfp_hf` 角色即可；电脑在有程序录音时会自动切到 HFP。
+- 蓝牙模式没有主机状态和插件面板。
 - 蓝牙音频延迟明显高于 Wi-Fi 模式，玩游戏建议用 Wi-Fi。
 - Linux 电脑不会自己打开蓝牙音频连接，装了 `flipad-host` 才会自动连接；其他系统需要在声音设置里手动选择「Flip Pad」。
 - 关闭掌机的 Wi-Fi 省电模式需要一条 sudo 规则（允许 `iw dev wlan0 set power_save on|off`）；没有这条规则时会跳过，偶尔会有延迟尖峰。

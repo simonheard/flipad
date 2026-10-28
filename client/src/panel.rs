@@ -664,7 +664,12 @@ fn settings(ui: &mut Ui, v: &View, s: &Settings) {
     };
     if v.bluetooth {
         ui.text("蓝牙音频", ix, y + 66.0, 42.0, TEXT, true, Align::Left);
-        let lines = ["在电脑的声音设置里选「Flip Pad」作为输出", "声音从左边「掌机出声」选的位置出来", "蓝牙音频延迟较高，玩游戏建议用 Wi-Fi 模式"];
+        let lines = [
+            "在电脑的声音设置里选「Flip Pad」作为输出",
+            "声音从左边「掌机出声」选的位置出来",
+            "蓝牙音频延迟较高，玩游戏建议用 Wi-Fi 模式",
+            "蓝牙模式没有麦克风，需要麦克风请用 Wi-Fi 模式",
+        ];
         for (i, l) in lines.into_iter().enumerate() {
             ui.text(l, ix, y + 130.0 + i as f32 * 52.0, 30.0, DIM, false, Align::Left);
         }
