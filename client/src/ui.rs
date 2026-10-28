@@ -371,14 +371,20 @@ pub fn preview(path: &str) -> Result<(), String> {
         playing: Some(2),
         screen_off: false,
         last_action: Some((HostAction::VolumeUp, Instant::now())),
+        bluetooth: false,
     };
     let settings = Settings { turbo: button::SOUTH | crate::settings::TURBO_RT, ..Settings::default() };
     let tabs = [Tab::Overview, Tab::Touchpad, Tab::Quick, Tab::Macros, Tab::Settings];
-    let mut sheet = Pixmap::new(1920, 1080 * (tabs.len() as u32 + 1)).unwrap();
-    for (i, tab) in tabs.iter().chain([Tab::Overview].iter()).enumerate() {
+    let mut sheet = Pixmap::new(1920, 1080 * (tabs.len() as u32 + 2)).unwrap();
+    for (i, tab) in tabs.iter().chain([Tab::Overview, Tab::Overview].iter()).enumerate() {
         let mut cv = Canvas { pm: Pixmap::new(1920, 1080).unwrap(), ts: Transform::identity(), scale: 1.0, ox: 0.0, oy: 0.0 };
         let mut hits = Vec::new();
-        let v = View { screen_off: i == tabs.len(), ..view.clone() };
+        let v = View {
+            screen_off: i == tabs.len(),
+            bluetooth: i == tabs.len() + 1,
+            host: if i == tabs.len() + 1 { "MY-DESKTOP".into() } else { view.host.clone() },
+            ..view.clone()
+        };
         let flash = (*tab == Tab::Quick).then(|| (Hit::Action(HostAction::PlayPause), Instant::now()));
         let mut ui = Ui { cv: &mut cv, text: &mut text, hits: &mut hits, flash, now: Instant::now(), drag_lock: false, fingers: 0 };
         panel::render(&mut ui, &v, &settings, *tab, (Some(76), false));

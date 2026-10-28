@@ -211,6 +211,7 @@ pub fn render(ui: &mut Ui, v: &View, s: &Settings, tab: Tab, battery: (Option<u8
     status_bar(ui, v, battery);
     match tab {
         Tab::Overview => overview(ui, v),
+        Tab::Touchpad | Tab::Quick if v.bluetooth => wifi_only(ui),
         Tab::Touchpad => touchpad(ui),
         Tab::Quick => quick(ui),
         Tab::Macros => macros(ui, v, s),
@@ -221,6 +222,9 @@ pub fn render(ui: &mut Ui, v: &View, s: &Settings, tab: Tab, battery: (Option<u8
 
 fn status_bar(ui: &mut Ui, v: &View, battery: (Option<u8>, bool)) {
     let (dot, label) = match &v.phase {
+        Phase::Searching if v.bluetooth => (WARN, "蓝牙：等待主机连接".to_string()),
+        Phase::Connecting if v.bluetooth => (WARN, format!("蓝牙：{} 正在启用手柄", v.host)),
+        Phase::Connected if v.bluetooth => (GOOD, format!("蓝牙：{}", v.host)),
         Phase::Searching => (WARN, "正在寻找主机…".to_string()),
         Phase::Connecting => (WARN, "正在连接…".to_string()),
         Phase::Connected => (GOOD, v.host.clone()),
@@ -288,8 +292,51 @@ fn tab_bar(ui: &mut Ui, tab: Tab) {
     }
 }
 
+fn wifi_only(ui: &mut Ui) {
+    let (y, h) = (TOP + 8.0, BOTTOM - 8.0 - TOP - 8.0);
+    ui.card(M, y, W - 2.0 * M, h);
+    ui.text("蓝牙模式下不可用", W / 2.0, y + h / 2.0 - 20.0, 52.0, TEXT, true, Align::Center);
+    ui.text("快捷操作和触控板需要电脑上的 flipad 服务，请用 Wi-Fi 模式", W / 2.0, y + h / 2.0 + 50.0, 32.0, DIM, false, Align::Center);
+}
+
+fn bluetooth_info(ui: &mut Ui, v: &View, x: f32, w: f32) {
+    let (y, h) = (TOP + 8.0, BOTTOM - 8.0 - TOP - 8.0);
+    ui.card(x, y, w, h);
+    let (ix, mut ty) = (x + 40.0, y + 76.0);
+    ui.text("蓝牙模式", ix, ty, 48.0, TEXT, true, Align::Left);
+    ty += 70.0;
+    let state = match v.phase {
+        Phase::Connected => format!("已连接到 {}", v.host),
+        Phase::Connecting => format!("{} 已连接，等待它启用手柄…", v.host),
+        _ => "等待连接".to_string(),
+    };
+    let c = if v.phase == Phase::Connected { GOOD } else { WARN };
+    ui.text(&state, ix, ty, 34.0, c, true, Align::Left);
+    ty += 90.0;
+    let lines = [
+        "第一次使用：在电脑或手机的蓝牙设置里",
+        "搜索并配对「Xbox Wireless Controller」",
+        "",
+        "配对过的设备打开蓝牙后会自动重连",
+        "电脑上不用装任何东西，按 Xbox 手柄识别",
+        "",
+        "布局切换、连发、宏照常可用",
+        "快捷操作、触控板、耳机音频需要 Wi-Fi 模式",
+    ];
+    for l in lines {
+        if !l.is_empty() {
+            ui.text(l, ix, ty, 30.0, if l.starts_with('搜') { TEXT } else { DIM }, l.starts_with('搜'), Align::Left);
+        }
+        ty += 52.0;
+    }
+}
+
 fn overview(ui: &mut Ui, v: &View) {
     controller(ui, &v.pad, 1040.0);
+    if v.bluetooth {
+        bluetooth_info(ui, v, M + 1040.0 + 24.0, W - 2.0 * M - 1040.0 - 24.0);
+        return;
+    }
 
     // compact host readings
     let (x, w) = (M + 1040.0 + 24.0, W - 2.0 * M - 1040.0 - 24.0);

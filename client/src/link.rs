@@ -57,6 +57,9 @@ pub struct View {
     pub screen_off: bool,
     /// Last shortcut sent, for a brief confirmation on screen.
     pub last_action: Option<(HostAction, Instant)>,
+    /// Running as a Bluetooth controller (no host service: no shortcuts,
+    /// touchpad, audio or host readings).
+    pub bluetooth: bool,
 }
 
 /// Touchpad input queued by the panel, in design pixels.
@@ -177,12 +180,12 @@ pub fn apply_event(pad: &mut Pad, ev: &InputEvent) {
     }
 }
 
-struct Motor {
-    effect: Option<FFEffect>,
+pub struct Motor {
+    pub effect: Option<FFEffect>,
 }
 
 impl Motor {
-    fn play(&mut self, dev: &mut RawDevice, strong: u16, weak: u16, ms: u16) {
+    pub fn play(&mut self, dev: &mut RawDevice, strong: u16, weak: u16, ms: u16) {
         if strong == 0 && weak == 0 {
             if let Some(e) = &mut self.effect {
                 let _ = e.stop();

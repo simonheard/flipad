@@ -7,6 +7,8 @@
 //! process) hands them back.
 
 mod audio;
+mod ble;
+mod btlink;
 mod link;
 mod paint;
 mod panel;
@@ -53,6 +55,7 @@ fn wifi_power_save(on: bool) {
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut host_arg = None;
+    let mut bluetooth = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--guard" => {
@@ -69,6 +72,7 @@ fn main() {
                 return;
             }
             "--host" => host_arg = args.next(),
+            "--bluetooth" => bluetooth = true,
             "--preview" => {
                 let out = args.next().unwrap_or_else(|| "flipad-preview.png".into());
                 if let Err(e) = ui::preview(&out) {
@@ -77,7 +81,7 @@ fn main() {
                 return;
             }
             _ => {
-                eprintln!("usage: flipad-client [--host ADDR[:PORT]] | --restore | --guard PID");
+                eprintln!("usage: flipad-client [--host ADDR[:PORT] | --bluetooth] | --restore | --guard PID");
                 std::process::exit(2);
             }
         }
@@ -99,7 +103,7 @@ fn main() {
         unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) }
     };
     let shared = Arc::new(Shared {
-        view: Mutex::new(View::default()),
+        view: Mutex::new(View { bluetooth, ..View::default() }),
         quit,
         jack: Arc::default(),
         settings: Mutex::new(settings::Settings::load()),
@@ -129,8 +133,10 @@ fn main() {
             link_shared.view.lock().unwrap().phase = Phase::Rejected(msg);
             (link_shared.notify)();
         };
-        let Some(token) = token else {
-            return fail(format!("缺少 {}", config_dir().join("token").display()));
+        let token = match token {
+            Some(t) => t,
+            None if bluetooth => [0; flipad_proto::TOKEN_LEN],
+            None => return fail(format!("缺少 {}", config_dir().join("token").display())),
         };
         let path = match plumber::borrow() {
             Ok(p) => p,
@@ -159,6 +165,17 @@ fn main() {
         if let Err(e) = dev.grab() {
             let _ = plumber::restore();
             return fail(format!("grab: {e}"));
+        }
+        if bluetooth {
+            if let Err(e) = btlink::run(dev, wake_r, link_shared.clone()) {
+                eprintln!("bluetooth: {e}");
+            }
+            if let Err(e) = plumber::restore() {
+                eprintln!("restore: {e}");
+            }
+            link_shared.quit.store(true, Ordering::Relaxed);
+            (link_shared.notify)();
+            return;
         }
         wifi_power_save(false);
         let name = std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "flip2".into());
