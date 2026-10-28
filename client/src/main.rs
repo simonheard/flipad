@@ -92,12 +92,20 @@ fn main() {
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT, signal_hook::consts::SIGHUP] {
         let _ = signal_hook::flag::register(sig, quit.clone());
     }
+    let (wake_r, wake_w) = {
+        let mut fds = [0; 2];
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        use std::os::fd::FromRawFd;
+        unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) }
+    };
     let shared = Arc::new(Shared {
         view: Mutex::new(View::default()),
         quit,
         jack: Arc::default(),
         settings: Mutex::new(settings::Settings::load()),
         cmds: Mutex::default(),
+        pointer: Mutex::default(),
+        wake: wake_w,
         notify: Box::new(move || {
             let _ = proxy.send_event(());
         }),
@@ -155,7 +163,7 @@ fn main() {
         wifi_power_save(false);
         let name = std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "flip2".into());
         let cfg = link::Config { token, host, name };
-        if let Err(e) = link::run(dev, cfg, link_shared.clone()) {
+        if let Err(e) = link::run(dev, wake_r, cfg, link_shared.clone()) {
             eprintln!("link: {e}");
         }
         // `dev` was moved into run and is closed (ungrabbed) by now

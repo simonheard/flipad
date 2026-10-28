@@ -59,6 +59,16 @@ pub struct View {
     pub last_action: Option<(HostAction, Instant)>,
 }
 
+/// Touchpad input queued by the panel, in design pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerOp {
+    Move(f32, f32),
+    /// Scroll in 1/120 notches (vertical, horizontal); positive = up / right.
+    Scroll(f32, f32),
+    /// New button state: bit 0 left, 1 right, 2 middle.
+    Buttons(u8),
+}
+
 /// Requests from the touch panel to the forwarding loop.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Cmd {
@@ -75,6 +85,10 @@ pub struct Shared {
     pub jack: Arc<Mutex<Jack>>,
     pub settings: Mutex<Settings>,
     pub cmds: Mutex<Vec<Cmd>>,
+    pub pointer: Mutex<Vec<PointerOp>>,
+    /// Write end of a pipe the forwarding loop polls, to act on panel input
+    /// immediately instead of at its next keepalive.
+    pub wake: std::os::fd::OwnedFd,
     /// Called whenever `view` changed.
     pub notify: Box<dyn Fn() + Send + Sync>,
 }
@@ -82,6 +96,17 @@ pub struct Shared {
 impl Shared {
     pub fn command(&self, c: Cmd) {
         self.cmds.lock().unwrap().push(c);
+        self.poke();
+    }
+
+    pub fn pointer(&self, op: PointerOp) {
+        self.pointer.lock().unwrap().push(op);
+        self.poke();
+    }
+
+    fn poke(&self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::write(self.wake.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
     }
 
     pub fn update(&self, f: impl FnOnce(&mut View)) {
@@ -205,10 +230,10 @@ fn open_socket() -> std::io::Result<UdpSocket> {
 }
 
 /// Runs until `shared.quit` is set. `dev` must already be grabbed.
-pub fn run(dev: RawDevice, cfg: Config, shared: Arc<Shared>) -> std::io::Result<()> {
+pub fn run(dev: RawDevice, wake: std::os::fd::OwnedFd, cfg: Config, shared: Arc<Shared>) -> std::io::Result<()> {
     let sock = open_socket()?;
     let mut ended = Ended { sock: &sock, to: None };
-    serve(dev, cfg, shared, &sock, &mut ended)
+    serve(dev, wake, cfg, shared, &sock, &mut ended)
 }
 
 /// Says goodbye however the loop ends, so the host unplugs the controller now
@@ -228,7 +253,14 @@ impl Drop for Ended<'_> {
     }
 }
 
-fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket, ended: &mut Ended) -> std::io::Result<()> {
+fn serve(
+    mut dev: RawDevice,
+    wake: std::os::fd::OwnedFd,
+    cfg: Config,
+    shared: Arc<Shared>,
+    sock: &UdpSocket,
+    ended: &mut Ended,
+) -> std::io::Result<()> {
     let broadcast: SocketAddr = ([255, 255, 255, 255], PORT).into();
     let mut host = cfg.host;
     let mut session: Option<u32> = None;
@@ -241,6 +273,10 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
     let mut last_retry = Instant::now() - RETRY;
     let mut ping_id: u32 = 0;
     let mut action_id: u32 = 0;
+    let mut pointer_seq: u32 = 0;
+    let mut pointer_buttons: u8 = 0;
+    // sub-unit leftovers so slow finger motion is not rounded away
+    let mut pointer_rest = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut motor = Motor { effect: None };
     let mut buf = [0u8; 512];
     let mut shaper = Shaper::new(load_macros(), Instant::now());
@@ -267,16 +303,21 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
     while !shared.quit.load(Ordering::Relaxed) {
         ended.to = host.zip(session);
         let now = Instant::now();
-        let mut wake = last_send + KEEPALIVE;
+        let mut wake_at = last_send + KEEPALIVE;
         if let Some(d) = shaper.deadline(&settings, now) {
-            wake = wake.min(d);
+            wake_at = wake_at.min(d);
         }
-        let wait = wake.saturating_duration_since(now).as_millis().clamp(1, 20) as i32;
+        let wait = wake_at.saturating_duration_since(now).as_millis().clamp(1, 20) as i32;
         let mut fds = [
             libc::pollfd { fd: dev.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         ];
-        unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) };
+        unsafe { libc::poll(fds.as_mut_ptr(), 3, wait) };
+        if fds[2].revents & libc::POLLIN != 0 {
+            let mut drain = [0u8; 64];
+            unsafe { libc::read(wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) };
+        }
         let now = Instant::now();
 
         // settings may have been changed on the panel
@@ -343,6 +384,56 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
         }
         if macros_changed {
             save_macros(&shaper.macros);
+        }
+
+        // touchpad: merge motion, and send every button change on its own
+        let ops: Vec<PointerOp> = std::mem::take(&mut *shared.pointer.lock().unwrap());
+        if !ops.is_empty()
+            && let (Some(to), Some(id)) = (host, session)
+        {
+            let speed = settings.pointer_speed as f32 / 100.0;
+            let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let mut flush = |acc: &mut (f32, f32, f32, f32), buttons: u8, twice: bool| {
+                let r = &mut pointer_rest;
+                let take = |v: f32, rest: &mut f32| {
+                    let t = v + *rest;
+                    let whole = t.trunc().clamp(i16::MIN as f32, i16::MAX as f32);
+                    *rest = t - whole;
+                    whole as i16
+                };
+                let dx = take(acc.0, &mut r.0);
+                let dy = take(acc.1, &mut r.1);
+                let wheel = take(acc.2, &mut r.2);
+                let hwheel = take(acc.3, &mut r.3);
+                *acc = (0.0, 0.0, 0.0, 0.0);
+                if dx == 0 && dy == 0 && wheel == 0 && hwheel == 0 && !twice {
+                    return;
+                }
+                pointer_seq = pointer_seq.wrapping_add(1);
+                let m = Msg::Pointer { session: id, seq: pointer_seq, dx, dy, wheel, hwheel, buttons };
+                send(to, &m);
+                if twice {
+                    send(to, &m); // button changes must not get lost
+                }
+            };
+            for op in ops {
+                match op {
+                    PointerOp::Move(x, y) => {
+                        acc.0 += x * speed;
+                        acc.1 += y * speed;
+                    }
+                    PointerOp::Scroll(v, h) => {
+                        acc.2 += v;
+                        acc.3 += h;
+                    }
+                    PointerOp::Buttons(b) => {
+                        flush(&mut acc, pointer_buttons, false);
+                        pointer_buttons = b;
+                        flush(&mut acc, b, true);
+                    }
+                }
+            }
+            flush(&mut acc, pointer_buttons, false);
         }
         let progress = shaper.exit_progress(now);
         let status = (shaper.recording(), shaper.playing());

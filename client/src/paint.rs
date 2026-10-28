@@ -61,6 +61,7 @@ fn paint(color: Color) -> Paint<'static> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum Align {
     Left,
     Center,

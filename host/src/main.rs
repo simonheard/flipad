@@ -2,6 +2,7 @@
 
 mod audio;
 mod keys;
+mod mouse;
 mod pad;
 mod stats;
 
@@ -29,6 +30,7 @@ struct Session {
     jack: (bool, bool),
     /// Recent action ids; the client sends each action a few times.
     actions: Vec<u32>,
+    pointer_seq: Option<u32>,
 }
 
 fn config_dir() -> std::path::PathBuf {
@@ -109,6 +111,7 @@ fn main() -> std::io::Result<()> {
         }
     });
 
+    let mut mouse = mouse::Mouse::new().map_err(|e| eprintln!("virtual mouse: {e}")).ok();
     let mut session: Option<Session> = None;
     let mut buf = [0u8; 512];
     while !quit.load(Ordering::Relaxed) {
@@ -122,7 +125,11 @@ fn main() -> std::io::Result<()> {
         if fds[0].revents & libc::POLLIN != 0 {
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
                 let Some(msg) = Msg::decode(&buf[..n]) else { continue };
-                handle(&sock, &mut session, &peer, &audio, &keys_tx, &token, &name, msg, from, now);
+                let had_session = session.is_some();
+                handle(&sock, &mut session, &peer, &audio, &keys_tx, mouse.as_mut(), &token, &name, msg, from, now);
+                if had_session && session.is_none() && let Some(m) = &mut mouse {
+                    m.release();
+                }
             }
         }
 
@@ -138,6 +145,9 @@ fn main() -> std::io::Result<()> {
                 session = None;
                 *peer.lock().unwrap() = None;
                 audio.set(None);
+                if let Some(m) = &mut mouse {
+                    m.release();
+                }
             } else if silent > NEUTRAL_AFTER && s.pad.state() != Pad::default() {
                 let _ = s.pad.apply(Pad::default());
             }
@@ -155,6 +165,7 @@ fn handle(
     peer: &Mutex<Option<SocketAddr>>,
     audio: &audio::Audio,
     keys: &std::sync::mpsc::Sender<HostAction>,
+    mouse: Option<&mut mouse::Mouse>,
     token: &[u8; TOKEN_LEN],
     name: &str,
     msg: Msg,
@@ -189,7 +200,7 @@ fn handle(
             };
             let id = random_u32();
             eprintln!("{client} connected from {from}");
-            *session = Some(Session { addr: from, id, seq: None, last_seen: now, name: client, pad, jack: (false, false), actions: Vec::new() });
+            *session = Some(Session { addr: from, id, seq: None, last_seen: now, name: client, pad, jack: (false, false), actions: Vec::new(), pointer_seq: None });
             audio.set(None);
             *peer.lock().unwrap() = Some(from);
             send(sock, from, &Msg::Welcome { session: id, name: name.into() });
@@ -215,6 +226,17 @@ fn handle(
                 *session = None;
                 *peer.lock().unwrap() = None;
                 audio.set(None);
+            }
+        }
+        Msg::Pointer { session: id, seq, dx, dy, wheel, hwheel, buttons } => {
+            if let Some(s) = session.as_mut().filter(|s| ours(s, id)) {
+                s.last_seen = now;
+                if s.pointer_seq.is_none_or(|last| seq_newer(seq, last)) {
+                    s.pointer_seq = Some(seq);
+                    if let Some(m) = mouse {
+                        m.apply(dx, dy, wheel, hwheel, buttons);
+                    }
+                }
             }
         }
         Msg::Action { session: id, id: action_id, action } => {

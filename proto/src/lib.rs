@@ -120,6 +120,10 @@ pub enum Msg {
     Jack { session: u32, headphones: bool, mic: bool },
     /// client → host: run a shortcut. `id` lets the host drop repeats.
     Action { session: u32, id: u32, action: HostAction },
+    /// client → host: touchpad mouse. Motion and wheel are deltas (wheel in
+    /// 1/120 notches); `buttons` is the full state (bit 0 left, 1 right,
+    /// 2 middle). A packet may be sent twice; the host drops old `seq`.
+    Pointer { session: u32, seq: u32, dx: i16, dy: i16, wheel: i16, hwheel: i16, buttons: u8 },
 }
 
 mod kind {
@@ -136,6 +140,7 @@ mod kind {
     pub const BYE: u8 = 11;
     pub const JACK: u8 = 12;
     pub const ACTION: u8 = 13;
+    pub const POINTER: u8 = 14;
 }
 
 struct W(Vec<u8>);
@@ -257,6 +262,14 @@ impl Msg {
                 W::new(kind::JACK).u32(*session).u8(*headphones as u8 | (*mic as u8) << 1)
             }
             Msg::Action { session, id, action } => W::new(kind::ACTION).u32(*session).u32(*id).u8(*action as u8),
+            Msg::Pointer { session, seq, dx, dy, wheel, hwheel, buttons } => W::new(kind::POINTER)
+                .u32(*session)
+                .u32(*seq)
+                .i16(*dx)
+                .i16(*dy)
+                .i16(*wheel)
+                .i16(*hwheel)
+                .u8(*buttons),
         }
         .0
     }
@@ -296,6 +309,15 @@ impl Msg {
                 mem_pct: r.opt_u8()?,
             }),
             kind::BYE => Msg::Bye { session: r.u32()? },
+            kind::POINTER => Msg::Pointer {
+                session: r.u32()?,
+                seq: r.u32()?,
+                dx: r.i16()?,
+                dy: r.i16()?,
+                wheel: r.i16()?,
+                hwheel: r.i16()?,
+                buttons: r.u8()?,
+            },
             kind::ACTION => Msg::Action { session: r.u32()?, id: r.u32()?, action: HostAction::from_u8(r.u8()?)? },
             kind::JACK => {
                 let session = r.u32()?;
@@ -347,6 +369,7 @@ mod tests {
             Msg::Jack { session: 3, headphones: true, mic: false },
             Msg::Jack { session: 4, headphones: false, mic: true },
             Msg::Action { session: 4, id: 7, action: HostAction::BigPicture },
+            Msg::Pointer { session: 4, seq: 9, dx: -300, dy: 12, wheel: -120, hwheel: 5, buttons: 0b101 },
         ];
         for m in msgs {
             assert_eq!(Msg::decode(&m.encode()), Some(m.clone()), "{m:?}");

@@ -13,13 +13,31 @@ use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::link::{Cmd, Shared, View};
+use crate::link::{Cmd, PointerOp, Shared, View};
 use crate::paint::{Canvas, Text};
 use crate::panel::{self, FLASH, Hit, Rect, Tab, Ui};
 use crate::settings::Settings;
 
 const H: f32 = 1080.0;
 const FRAME: Duration = Duration::from_millis(33);
+/// A touch shorter and smaller than this is a tap (a click).
+const TAP_TIME: Duration = Duration::from_millis(250);
+const TAP_MOVE: f32 = 24.0;
+/// Two-finger / strip scrolling: 1/120 notches per design pixel.
+const SCROLL_PER_PX: f32 = 3.0;
+
+/// A touch sequence on the touchpad or the scroll strip.
+struct Gesture {
+    strip: bool,
+    /// Finger id → last position (design units).
+    fingers: Vec<(u64, f32, f32)>,
+    max_fingers: usize,
+    start: Instant,
+    travel: f32,
+}
+
+/// Mouse events stand in for touch when the compositor only sends a pointer.
+const MOUSE_FINGER: u64 = u64::MAX;
 
 pub struct App {
     shared: Arc<Shared>,
@@ -31,6 +49,9 @@ pub struct App {
     tab: Tab,
     flash: Option<(Hit, Instant)>,
     cursor: (f64, f64),
+    gesture: Option<Gesture>,
+    drag_lock: bool,
+    last_touch: Option<Instant>,
     dirty: bool,
     last_draw: Instant,
     battery: (Option<u8>, bool),
@@ -50,6 +71,9 @@ impl App {
             tab: Tab::default(),
             flash: None,
             cursor: (0.0, 0.0),
+            gesture: None,
+            drag_lock: false,
+            last_touch: None,
             dirty: true,
             last_draw: Instant::now() - FRAME,
             battery: (None, false),
@@ -62,10 +86,84 @@ impl App {
         el.exit();
     }
 
-    fn tap(&mut self, el: &ActiveEventLoop, x: f64, y: f64) {
-        let Some(cv) = &self.canvas else { return };
-        let (dx, dy) = ((x as f32 - cv.ox) / cv.scale, (y as f32 - cv.oy) / cv.scale);
-        let Some(&(_, hit)) = self.hits.iter().rev().find(|(r, _)| r.contains(dx, dy)) else { return };
+    fn design(&self, x: f64, y: f64) -> (f32, f32) {
+        match &self.canvas {
+            Some(cv) => ((x as f32 - cv.ox) / cv.scale, (y as f32 - cv.oy) / cv.scale),
+            None => (x as f32, y as f32),
+        }
+    }
+
+    fn base_buttons(&self) -> u8 {
+        self.drag_lock as u8
+    }
+
+    fn click(&self, bit: u8) {
+        let base = self.base_buttons();
+        self.shared.pointer(PointerOp::Buttons(base | bit));
+        self.shared.pointer(PointerOp::Buttons(base));
+    }
+
+    /// A finger (or the mouse) went down.
+    fn touch_down(&mut self, el: &ActiveEventLoop, id: u64, x: f64, y: f64) {
+        let (dx, dy) = self.design(x, y);
+        if let Some(g) = &mut self.gesture {
+            if !g.strip && !g.fingers.iter().any(|f| f.0 == id) {
+                g.fingers.push((id, dx, dy));
+                g.max_fingers = g.max_fingers.max(g.fingers.len());
+                self.dirty = true;
+            }
+            return;
+        }
+        let hit = self.hits.iter().rev().find(|(r, _)| r.contains(dx, dy)).map(|h| h.1);
+        match hit {
+            Some(Hit::Pad) | Some(Hit::ScrollStrip) => {
+                self.gesture = Some(Gesture {
+                    strip: hit == Some(Hit::ScrollStrip),
+                    fingers: vec![(id, dx, dy)],
+                    max_fingers: 1,
+                    start: Instant::now(),
+                    travel: 0.0,
+                });
+                self.dirty = true;
+            }
+            Some(h) => self.tap(el, h),
+            None => {}
+        }
+    }
+
+    fn touch_move(&mut self, id: u64, x: f64, y: f64) {
+        let (nx, ny) = self.design(x, y);
+        let Some(g) = &mut self.gesture else { return };
+        let n = g.fingers.len() as f32;
+        let Some(f) = g.fingers.iter_mut().find(|f| f.0 == id) else { return };
+        let (ddx, ddy) = (nx - f.1, ny - f.2);
+        f.1 = nx;
+        f.2 = ny;
+        g.travel += ddx.hypot(ddy);
+        if g.strip {
+            self.shared.pointer(PointerOp::Scroll(-ddy * SCROLL_PER_PX * 1.5, 0.0));
+        } else if n >= 2.0 {
+            // natural scrolling: content follows the fingers
+            self.shared.pointer(PointerOp::Scroll(ddy * SCROLL_PER_PX / n, -ddx * SCROLL_PER_PX / n));
+        } else {
+            self.shared.pointer(PointerOp::Move(ddx, ddy));
+        }
+    }
+
+    fn touch_up(&mut self, id: u64) {
+        let Some(g) = &mut self.gesture else { return };
+        g.fingers.retain(|f| f.0 != id);
+        if !g.fingers.is_empty() {
+            return;
+        }
+        let g = self.gesture.take().unwrap();
+        self.dirty = true;
+        if !g.strip && g.start.elapsed() < TAP_TIME && g.travel < TAP_MOVE {
+            self.click(if g.max_fingers >= 2 { 2 } else { 1 });
+        }
+    }
+
+    fn tap(&mut self, el: &ActiveEventLoop, hit: Hit) {
         self.flash = Some((hit, Instant::now()));
         self.dirty = true;
         let sh = &self.shared;
@@ -75,7 +173,21 @@ impl App {
             s.save();
         };
         match hit {
-            Hit::Tab(t) => self.tab = t,
+            Hit::Tab(t) => {
+                if t != Tab::Touchpad && self.drag_lock {
+                    self.drag_lock = false;
+                    sh.pointer(PointerOp::Buttons(0));
+                }
+                self.tab = t;
+            }
+            Hit::MouseLeft => self.click(1),
+            Hit::MouseRight => self.click(2),
+            Hit::DragLock => {
+                self.drag_lock = !self.drag_lock;
+                sh.pointer(PointerOp::Buttons(self.base_buttons()));
+            }
+            Hit::PointerSpeed(p) => set(&|s| s.pointer_speed = p),
+            Hit::Pad | Hit::ScrollStrip => {}
             Hit::Exit => self.quit(el),
             Hit::ScreenOff => sh.update(|v| v.screen_off = true),
             Hit::Wake => sh.update(|v| v.screen_off = false),
@@ -92,6 +204,10 @@ impl App {
             Hit::Mic => set(&|s| s.mic = !s.mic),
             Hit::Latency(ms) => set(&|s| s.audio_latency_ms = ms),
         }
+    }
+
+    fn mouse_ok(&self) -> bool {
+        self.last_touch.is_none_or(|t| t.elapsed() > Duration::from_secs(2))
     }
 
     fn draw(&mut self) {
@@ -117,7 +233,9 @@ impl App {
         let settings = *self.shared.settings.lock().unwrap();
         let cv = self.canvas.as_mut().unwrap();
         if let Some(text) = &mut self.text {
-            let mut ui = Ui { cv, text, hits: &mut self.hits, flash: self.flash, now: Instant::now() };
+            let fingers = self.gesture.as_ref().map_or(0, |g| g.fingers.len());
+            let mut ui =
+                Ui { cv, text, hits: &mut self.hits, flash: self.flash, now: Instant::now(), drag_lock: self.drag_lock, fingers };
             panel::render(&mut ui, &view, &settings, self.tab, self.battery);
         }
         if surface.resize(w, h).is_err() {
@@ -171,12 +289,29 @@ impl ApplicationHandler<()> for App {
             WindowEvent::CloseRequested => self.quit(el),
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Resized(_) => self.dirty = true,
-            WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let (x, y) = self.cursor;
-                self.tap(el, x, y);
+            // real touch events win; the pointer is only a fallback
+            WindowEvent::Touch(t) => {
+                self.last_touch = Some(Instant::now());
+                let (x, y) = (t.location.x, t.location.y);
+                match t.phase {
+                    TouchPhase::Started => self.touch_down(el, t.id, x, y),
+                    TouchPhase::Moved => self.touch_move(t.id, x, y),
+                    TouchPhase::Ended | TouchPhase::Cancelled => self.touch_up(t.id),
+                }
             }
-            WindowEvent::Touch(t) if t.phase == TouchPhase::Started => self.tap(el, t.location.x, t.location.y),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+                if self.mouse_ok() {
+                    self.touch_move(MOUSE_FINGER, position.x, position.y);
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if self.mouse_ok() => {
+                let (x, y) = self.cursor;
+                match state {
+                    ElementState::Pressed => self.touch_down(el, MOUSE_FINGER, x, y),
+                    ElementState::Released => self.touch_up(MOUSE_FINGER),
+                }
+            }
             _ => {}
         }
     }
@@ -238,14 +373,14 @@ pub fn preview(path: &str) -> Result<(), String> {
         last_action: Some((HostAction::VolumeUp, Instant::now())),
     };
     let settings = Settings { turbo: button::SOUTH | crate::settings::TURBO_RT, ..Settings::default() };
-    let tabs = [Tab::Overview, Tab::Quick, Tab::Macros, Tab::Settings];
+    let tabs = [Tab::Overview, Tab::Touchpad, Tab::Quick, Tab::Macros, Tab::Settings];
     let mut sheet = Pixmap::new(1920, 1080 * (tabs.len() as u32 + 1)).unwrap();
     for (i, tab) in tabs.iter().chain([Tab::Overview].iter()).enumerate() {
         let mut cv = Canvas { pm: Pixmap::new(1920, 1080).unwrap(), ts: Transform::identity(), scale: 1.0, ox: 0.0, oy: 0.0 };
         let mut hits = Vec::new();
         let v = View { screen_off: i == tabs.len(), ..view.clone() };
         let flash = (*tab == Tab::Quick).then(|| (Hit::Action(HostAction::PlayPause), Instant::now()));
-        let mut ui = Ui { cv: &mut cv, text: &mut text, hits: &mut hits, flash, now: Instant::now() };
+        let mut ui = Ui { cv: &mut cv, text: &mut text, hits: &mut hits, flash, now: Instant::now(), drag_lock: false, fingers: 0 };
         panel::render(&mut ui, &v, &settings, *tab, (Some(76), false));
         sheet.draw_pixmap(0, (i * 1080) as i32, cv.pm.as_ref(), &Default::default(), Default::default(), None);
     }

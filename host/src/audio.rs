@@ -19,6 +19,11 @@ const SOURCE: &str = "flipad_mic";
 /// Jitter buffer for the microphone stream.
 const MIC_LATENCY_MS: u32 = 30;
 
+fn memory_file(kind: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join(format!(".config/flipad/previous-default-{kind}"))
+}
+
 /// What the handheld currently wants; `None` = no handheld connected.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Want {
@@ -80,7 +85,16 @@ impl Route {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let previous = pactl(&[&format!("get-default-{kind}")]).filter(|p| p != node);
+        // PipeWire may already have made our node the default (it remembers a
+        // previous choice), so keep the real device in a file across sessions.
+        let file = memory_file(kind);
+        let previous = match pactl(&[&format!("get-default-{kind}")]).filter(|p| p != node) {
+            Some(p) => {
+                let _ = std::fs::write(&file, &p);
+                Some(p)
+            }
+            None => std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        };
         pactl(&[&format!("set-default-{kind}"), node]);
         eprintln!("audio: {node} is now the default {kind} (was {previous:?})");
         Some(Self { proc, ip, previous, kind, node })
