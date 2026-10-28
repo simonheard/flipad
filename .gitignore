@@ -1,2 +1,4 @@
 target/
 .cross-lib/
+__pycache__/
+*.pyc
