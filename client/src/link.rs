@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 use evdev::raw_stream::RawDevice;
 use evdev::{
     AbsoluteAxisCode as Abs, EventType, FFEffect, FFEffectData, FFEffectKind, FFReplay, FFTrigger, InputEvent,
-    KeyCode, SynchronizationCode,
+    KeyCode,
 };
-use flipad_proto::{Msg, PORT, Pad, Status, TOKEN_LEN, button};
+use flipad_proto::{HostAction, Msg, PORT, Pad, Status, TOKEN_LEN, button};
 
 use crate::audio::{Audio, Jack, Want};
+use crate::settings::{MACRO_SLOTS, Settings, load_macros, save_macros};
+use crate::shaper::{Event, Shaper};
 
 /// Re-send the current state this often even when nothing changes, so a lost
 /// packet is repaired quickly and the host knows we are alive.
@@ -22,9 +24,6 @@ const KEEPALIVE: Duration = Duration::from_millis(20);
 const PING_EVERY: Duration = Duration::from_millis(250);
 const LINK_LOST: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_millis(700);
-/// Hold Home + Select this long to quit.
-pub const EXIT_HOLD: Duration = Duration::from_millis(1500);
-const EXIT_COMBO: u32 = button::MODE | button::SELECT;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Phase {
@@ -50,18 +49,42 @@ pub struct View {
     /// Headset state, and whether audio is being routed (needs a connection).
     pub jack: Jack,
     pub audio_live: bool,
+    /// Per macro slot: length, or None when empty.
+    pub macros: [Option<Duration>; MACRO_SLOTS],
+    pub recording: Option<usize>,
+    pub playing: Option<usize>,
+    /// Black screen to save power (AMOLED); any touch wakes it.
+    pub screen_off: bool,
+    /// Last shortcut sent, for a brief confirmation on screen.
+    pub last_action: Option<(HostAction, Instant)>,
+}
+
+/// Requests from the touch panel to the forwarding loop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cmd {
+    Action(HostAction),
+    Record(usize),
+    StopRecording,
+    Play(usize),
+    Clear(usize),
 }
 
 pub struct Shared {
     pub view: Mutex<View>,
     pub quit: Arc<AtomicBool>,
     pub jack: Arc<Mutex<Jack>>,
+    pub settings: Mutex<Settings>,
+    pub cmds: Mutex<Vec<Cmd>>,
     /// Called whenever `view` changed.
     pub notify: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Shared {
-    fn update(&self, f: impl FnOnce(&mut View)) {
+    pub fn command(&self, c: Cmd) {
+        self.cmds.lock().unwrap().push(c);
+    }
+
+    pub fn update(&self, f: impl FnOnce(&mut View)) {
         f(&mut self.view.lock().unwrap());
         (self.notify)();
     }
@@ -209,7 +232,7 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
     let broadcast: SocketAddr = ([255, 255, 255, 255], PORT).into();
     let mut host = cfg.host;
     let mut session: Option<u32> = None;
-    let mut pad = Pad::default();
+    let mut phys = Pad::default();
     let mut sent = Pad::default();
     let mut seq: u32 = 0;
     let mut last_send = Instant::now() - KEEPALIVE;
@@ -217,15 +240,25 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
     let mut last_pong = Instant::now();
     let mut last_retry = Instant::now() - RETRY;
     let mut ping_id: u32 = 0;
-    let mut exit_since: Option<Instant> = None;
+    let mut action_id: u32 = 0;
     let mut motor = Motor { effect: None };
     let mut buf = [0u8; 512];
-    let latency = std::env::var("FLIPAD_AUDIO_LATENCY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
-    let audio = Audio::start(latency);
+    let mut shaper = Shaper::new(load_macros(), Instant::now());
+    let mut events: Vec<Event> = Vec::new();
+    let mut settings = *shared.settings.lock().unwrap();
+    let mut audio = Audio::start(settings.audio_latency_ms);
     let mut routed: Option<Want> = None;
     let mut jack_sent: Option<Jack> = None;
     let mut last_jack = Instant::now();
-    shared.update(|v| v.phase = if host.is_some() { Phase::Connecting } else { Phase::Searching });
+    let publish_macros = |shaper: &Shaper, v: &mut View| {
+        v.macros = std::array::from_fn(|i| (!shaper.macros[i].steps.is_empty()).then(|| shaper.macros[i].length()));
+        v.recording = shaper.recording();
+        v.playing = shaper.playing();
+    };
+    shared.update(|v| {
+        v.phase = if host.is_some() { Phase::Connecting } else { Phase::Searching };
+        publish_macros(&shaper, v);
+    });
 
     let send = |to: SocketAddr, m: &Msg| {
         let _ = sock.send_to(&m.encode(), to);
@@ -233,44 +266,107 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
 
     while !shared.quit.load(Ordering::Relaxed) {
         ended.to = host.zip(session);
+        let now = Instant::now();
+        let mut wake = last_send + KEEPALIVE;
+        if let Some(d) = shaper.deadline(&settings, now) {
+            wake = wake.min(d);
+        }
+        let wait = wake.saturating_duration_since(now).as_millis().clamp(1, 20) as i32;
         let mut fds = [
             libc::pollfd { fd: dev.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         ];
-        let wait = KEEPALIVE.saturating_sub(last_send.elapsed()).as_millis().max(1) as i32;
         unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) };
         let now = Instant::now();
+
+        // settings may have been changed on the panel
+        let new_settings = *shared.settings.lock().unwrap();
+        if new_settings != settings {
+            if new_settings.audio_latency_ms != settings.audio_latency_ms {
+                drop(audio);
+                audio = Audio::start(new_settings.audio_latency_ms);
+                routed = None;
+            }
+            if !new_settings.rumble {
+                motor.play(&mut dev, 0, 0, 0);
+            }
+            settings = new_settings;
+        }
 
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(std::io::Error::other("controller went away"));
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            let events: Vec<InputEvent> = dev.fetch_events()?.collect();
-            for ev in &events {
-                if ev.event_type() == EventType::SYNCHRONIZATION && ev.code() == SynchronizationCode::SYN_REPORT.0 {
-                    if pad != sent && let (Some(to), Some(id)) = (host, session) {
-                        seq = seq.wrapping_add(1);
-                        send(to, &Msg::State { session: id, seq, pad });
-                        sent = pad;
-                        last_send = now;
-                    }
-                } else {
-                    apply_event(&mut pad, ev);
+            for ev in dev.fetch_events()?.collect::<Vec<InputEvent>>() {
+                if ev.event_type() != EventType::SYNCHRONIZATION {
+                    apply_event(&mut phys, &ev);
                 }
             }
-            shared.update(|v| v.pad = pad);
         }
 
-        // exit combo
-        if pad.buttons & EXIT_COMBO == EXIT_COMBO {
-            let since = *exit_since.get_or_insert(now);
-            let p = (now.duration_since(since).as_secs_f32() / EXIT_HOLD.as_secs_f32()).min(1.0);
-            shared.update(|v| v.exit_hold = p);
-            if p >= 1.0 {
-                shared.quit.store(true, Ordering::Relaxed);
+        // panel commands
+        let cmds: Vec<Cmd> = std::mem::take(&mut *shared.cmds.lock().unwrap());
+        let mut macros_changed = false;
+        for c in cmds {
+            match c {
+                Cmd::Action(a) => events.push(Event::Action(a)),
+                Cmd::Record(i) => shaper.start_recording(i, now),
+                Cmd::StopRecording => macros_changed |= shaper.stop_recording(now).is_some(),
+                Cmd::Play(i) => shaper.play(i, now),
+                Cmd::Clear(i) => {
+                    shaper.clear(i);
+                    macros_changed = true;
+                }
             }
-        } else if exit_since.take().is_some() {
-            shared.update(|v| v.exit_hold = 0.0);
+        }
+
+        let was = (shaper.recording(), shaper.playing());
+        let out = shaper.update(phys, &settings, now, &mut events);
+        if shaper.recording().is_none() && was.0.is_some() {
+            macros_changed = true; // hit the length limit
+        }
+        for e in events.drain(..) {
+            match e {
+                Event::Action(a) => {
+                    if let (Some(to), Some(id)) = (host, session) {
+                        action_id = action_id.wrapping_add(1);
+                        for _ in 0..3 {
+                            send(to, &Msg::Action { session: id, id: action_id, action: a });
+                        }
+                    }
+                    shared.update(|v| v.last_action = Some((a, now)));
+                }
+                Event::PlayMacro(i) => shaper.play(i, now),
+                Event::ToggleScreen => shared.update(|v| v.screen_off = !v.screen_off),
+                Event::Quit => shared.quit.store(true, Ordering::Relaxed),
+            }
+        }
+        if macros_changed {
+            save_macros(&shaper.macros);
+        }
+        let progress = shaper.exit_progress(now);
+        let status = (shaper.recording(), shaper.playing());
+        {
+            let mut v = shared.view.lock().unwrap();
+            let changed = v.pad != phys || v.exit_hold != progress || status != was || macros_changed;
+            v.pad = phys;
+            v.exit_hold = progress;
+            if status != (v.recording, v.playing) || macros_changed {
+                publish_macros(&shaper, &mut v);
+            }
+            drop(v);
+            if changed {
+                (shared.notify)();
+            }
+        }
+
+        if out != sent
+            && let (Some(to), Some(id)) = (host, session)
+        {
+            seq = seq.wrapping_add(1);
+            send(to, &Msg::State { session: id, seq, pad: out });
+            sent = out;
+            last_send = now;
         }
 
         if fds[1].revents & libc::POLLIN != 0 {
@@ -287,7 +383,7 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
                     Some(Msg::Welcome { session: id, name }) if Some(from) == host => {
                         session = Some(id);
                         last_pong = now;
-                        sent = Pad { buttons: !pad.buttons, ..pad }; // force a full send
+                        sent = Pad { buttons: !out.buttons, ..out }; // force a full send
                         shared.update(|v| {
                             v.host = name;
                             v.phase = Phase::Connected;
@@ -308,8 +404,10 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
                         });
                     }
                     Some(Msg::Rumble { strong, weak, ms }) if Some(from) == host => {
-                        motor.play(&mut dev, strong, weak, ms);
-                        shared.update(|v| v.rumble = strong > 0 || weak > 0);
+                        if settings.rumble {
+                            motor.play(&mut dev, strong, weak, ms);
+                            shared.update(|v| v.rumble = strong > 0 || weak > 0);
+                        }
                     }
                     Some(Msg::Status(s)) if Some(from) == host => shared.update(|v| v.status = s),
                     _ => {}
@@ -317,6 +415,11 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
             }
         }
 
+        // headset routing follows the jack, filtered by the panel switches
+        let jack = {
+            let j = *shared.jack.lock().unwrap();
+            Jack { headphones: j.headphones && settings.audio, mic: j.mic && settings.mic }
+        };
         match (host, session) {
             (None, _) if now.duration_since(last_retry) >= RETRY => {
                 send(broadcast, &Msg::Discover);
@@ -327,7 +430,6 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
                 last_retry = now;
             }
             (Some(to), Some(id)) => {
-                let jack = *shared.jack.lock().unwrap();
                 if jack_sent != Some(jack) || now.duration_since(last_jack) >= Duration::from_secs(1) {
                     send(to, &Msg::Jack { session: id, headphones: jack.headphones, mic: jack.mic });
                     jack_sent = Some(jack);
@@ -335,8 +437,8 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
                 }
                 if now.duration_since(last_send) >= KEEPALIVE {
                     seq = seq.wrapping_add(1);
-                    send(to, &Msg::State { session: id, seq, pad });
-                    sent = pad;
+                    send(to, &Msg::State { session: id, seq, pad: out });
+                    sent = out;
                     last_send = now;
                 }
                 if now.duration_since(last_ping) >= PING_EVERY {
@@ -356,7 +458,7 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
             _ => {}
         }
 
-        let want = host.zip(session).map(|(to, _)| Want { host: to.ip(), jack: *shared.jack.lock().unwrap() });
+        let want = host.zip(session).map(|(to, _)| Want { host: to.ip(), jack });
         if want != routed {
             if want.is_none() {
                 jack_sent = None;
@@ -364,13 +466,13 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
             routed = want;
             audio.set(want);
             let live = want.is_some_and(|w| w.jack.headphones || w.jack.mic);
-            shared.update(|v| {
-                v.jack = want.map_or(*shared.jack.lock().unwrap(), |w| w.jack);
-                v.audio_live = live;
-            });
+            shared.update(|v| v.audio_live = live);
         }
     }
 
+    if shaper.stop_recording(Instant::now()).is_some() {
+        save_macros(&shaper.macros);
+    }
     drop(audio);
     motor.play(&mut dev, 0, 0, 0);
     ended.to = host.zip(session);

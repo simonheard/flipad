@@ -1,4 +1,5 @@
-//! Full-screen status page shown on the handheld while it acts as a controller.
+//! Window and touch handling for the handheld's panel (see `panel.rs` for
+//! what is drawn).
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -6,32 +7,19 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use flipad_proto::{Pad, button};
 use tiny_skia::{Pixmap, Transform};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::link::{Phase, Shared, View};
-use crate::paint::{Align, Canvas, Text, circle, rgba, rrect};
+use crate::link::{Cmd, Shared, View};
+use crate::paint::{Canvas, Text};
+use crate::panel::{self, FLASH, Hit, Rect, Tab, Ui};
+use crate::settings::Settings;
 
-const W: f32 = 1920.0;
 const H: f32 = 1080.0;
 const FRAME: Duration = Duration::from_millis(33);
-
-const BG: u32 = 0x0d0f13;
-const CARD: u32 = 0x161920;
-const TEXT: u32 = 0xe9ebf1;
-const DIM: u32 = 0x8a90a0;
-const FAINT: u32 = 0x3a3f4b;
-const ACCENT: u32 = 0x6ea8fe;
-const GOOD: u32 = 0x4ade80;
-const WARN: u32 = 0xf5b041;
-const BAD: u32 = 0xf87171;
-
-/// The exit button, in design units.
-const EXIT_BTN: (f32, f32, f32, f32) = (1572.0, 932.0, 300.0, 96.0);
 
 pub struct App {
     shared: Arc<Shared>,
@@ -39,6 +27,9 @@ pub struct App {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     canvas: Option<Canvas>,
+    hits: Vec<(Rect, Hit)>,
+    tab: Tab,
+    flash: Option<(Hit, Instant)>,
     cursor: (f64, f64),
     dirty: bool,
     last_draw: Instant,
@@ -55,6 +46,9 @@ impl App {
             window: None,
             surface: None,
             canvas: None,
+            hits: Vec::new(),
+            tab: Tab::default(),
+            flash: None,
             cursor: (0.0, 0.0),
             dirty: true,
             last_draw: Instant::now() - FRAME,
@@ -68,11 +62,36 @@ impl App {
         el.exit();
     }
 
-    fn hit_exit(&self, x: f64, y: f64) -> bool {
-        let Some(cv) = &self.canvas else { return false };
+    fn tap(&mut self, el: &ActiveEventLoop, x: f64, y: f64) {
+        let Some(cv) = &self.canvas else { return };
         let (dx, dy) = ((x as f32 - cv.ox) / cv.scale, (y as f32 - cv.oy) / cv.scale);
-        let (bx, by, bw, bh) = EXIT_BTN;
-        dx >= bx && dx <= bx + bw && dy >= by && dy <= by + bh
+        let Some(&(_, hit)) = self.hits.iter().rev().find(|(r, _)| r.contains(dx, dy)) else { return };
+        self.flash = Some((hit, Instant::now()));
+        self.dirty = true;
+        let sh = &self.shared;
+        let set = |f: &dyn Fn(&mut Settings)| {
+            let mut s = sh.settings.lock().unwrap();
+            f(&mut s);
+            s.save();
+        };
+        match hit {
+            Hit::Tab(t) => self.tab = t,
+            Hit::Exit => self.quit(el),
+            Hit::ScreenOff => sh.update(|v| v.screen_off = true),
+            Hit::Wake => sh.update(|v| v.screen_off = false),
+            Hit::Action(a) => sh.command(Cmd::Action(a)),
+            Hit::Record(i) => sh.command(Cmd::Record(i)),
+            Hit::StopRecording => sh.command(Cmd::StopRecording),
+            Hit::Play(i) => sh.command(Cmd::Play(i)),
+            Hit::Clear(i) => sh.command(Cmd::Clear(i)),
+            Hit::Turbo(bit) => set(&|s| s.turbo ^= bit),
+            Hit::TurboHz(hz) => set(&|s| s.turbo_hz = hz),
+            Hit::Nintendo(on) => set(&|s| s.nintendo = on),
+            Hit::Rumble => set(&|s| s.rumble = !s.rumble),
+            Hit::Audio => set(&|s| s.audio = !s.audio),
+            Hit::Mic => set(&|s| s.mic = !s.mic),
+            Hit::Latency(ms) => set(&|s| s.audio_latency_ms = ms),
+        }
     }
 
     fn draw(&mut self) {
@@ -80,8 +99,8 @@ impl App {
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         if self.canvas.as_ref().is_none_or(|c| c.pm.width() != size.width || c.pm.height() != size.height) {
-            let scale = (size.width as f32 / W).min(size.height as f32 / H);
-            let (ox, oy) = ((size.width as f32 - W * scale) / 2.0, (size.height as f32 - H * scale) / 2.0);
+            let scale = (size.width as f32 / panel::W).min(size.height as f32 / H);
+            let (ox, oy) = ((size.width as f32 - panel::W * scale) / 2.0, (size.height as f32 - H * scale) / 2.0);
             self.canvas = Some(Canvas {
                 pm: Pixmap::new(size.width, size.height).unwrap(),
                 ts: Transform::from_row(scale, 0.0, 0.0, scale, ox, oy),
@@ -95,10 +114,11 @@ impl App {
             self.battery_read = Instant::now();
         }
         let view = self.shared.view.lock().unwrap().clone();
+        let settings = *self.shared.settings.lock().unwrap();
         let cv = self.canvas.as_mut().unwrap();
-        cv.pm.fill(rgba(BG, 1.0));
         if let Some(text) = &mut self.text {
-            render(cv, text, &view, self.battery);
+            let mut ui = Ui { cv, text, hits: &mut self.hits, flash: self.flash, now: Instant::now() };
+            panel::render(&mut ui, &view, &settings, self.tab, self.battery);
         }
         if surface.resize(w, h).is_err() {
             return;
@@ -118,9 +138,7 @@ impl ApplicationHandler<()> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("Flip Pad")
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
+        let attrs = Window::default_attributes().with_title("Flip Pad").with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -155,15 +173,10 @@ impl ApplicationHandler<()> for App {
             WindowEvent::Resized(_) => self.dirty = true,
             WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                if self.hit_exit(self.cursor.0, self.cursor.1) {
-                    self.quit(el);
-                }
+                let (x, y) = self.cursor;
+                self.tap(el, x, y);
             }
-            WindowEvent::Touch(t) if t.phase == TouchPhase::Started => {
-                if self.hit_exit(t.location.x, t.location.y) {
-                    self.quit(el);
-                }
-            }
+            WindowEvent::Touch(t) if t.phase == TouchPhase::Started => self.tap(el, t.location.x, t.location.y),
             _ => {}
         }
     }
@@ -173,13 +186,16 @@ impl ApplicationHandler<()> for App {
             return el.exit();
         }
         let now = Instant::now();
-        // repaint at least once a second (battery), at most ~30 times a second
-        if now.duration_since(self.last_draw) >= Duration::from_secs(1) {
+        // keep animating while a tap flash or a status toast fades
+        let flashing = self.flash.is_some_and(|(_, t)| now.duration_since(t) < FLASH + FRAME);
+        let toast = self.shared.view.lock().unwrap().last_action.is_some_and(|(_, t)| now.duration_since(t) < Duration::from_millis(1600));
+        let idle_redraw = if toast { Duration::from_millis(250) } else { Duration::from_secs(1) };
+        if flashing || now.duration_since(self.last_draw) >= idle_redraw {
             self.dirty = true;
         }
         let next_frame = self.last_draw + FRAME;
         if !self.dirty {
-            el.set_control_flow(ControlFlow::WaitUntil(self.last_draw + Duration::from_secs(1)));
+            el.set_control_flow(ControlFlow::WaitUntil(self.last_draw + idle_redraw));
         } else if now >= next_frame {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -191,28 +207,6 @@ impl ApplicationHandler<()> for App {
     }
 }
 
-/// Renders a sample screen to a PNG (for checking the design off-device).
-pub fn preview(path: &str) -> Result<(), String> {
-    use flipad_proto::Status;
-    let mut text = Text::load()?;
-    let scale = 1.0;
-    let mut cv = Canvas { pm: Pixmap::new(1920, 1080).unwrap(), ts: Transform::identity(), scale, ox: 0.0, oy: 0.0 };
-    cv.pm.fill(rgba(BG, 1.0));
-    let view = View {
-        phase: Phase::Connected,
-        host: "my-desktop".into(),
-        rtt_ms: Some(2.4),
-        status: Status { cpu_pct: Some(23), cpu_temp: Some(54.0), gpu_pct: Some(78), gpu_temp: Some(71.0), mem_pct: Some(41) },
-        pad: Pad { buttons: button::SOUTH | button::TR | button::DPAD_LEFT, lx: -14000, ly: 22000, rx: 9000, ry: -4000, lt: 200, rt: 40 },
-        exit_hold: 0.4,
-        rumble: true,
-        jack: crate::audio::Jack { headphones: true, mic: true },
-        audio_live: true,
-    };
-    render(&mut cv, &mut text, &view, (Some(76), false));
-    cv.pm.save_png(path).map_err(|e| e.to_string())
-}
-
 fn read_battery() -> (Option<u8>, bool) {
     let base = "/sys/class/power_supply/battery";
     let cap = std::fs::read_to_string(format!("{base}/capacity")).ok().and_then(|s| s.trim().parse().ok());
@@ -220,158 +214,40 @@ fn read_battery() -> (Option<u8>, bool) {
     (cap, charging)
 }
 
-fn card(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32) {
-    cv.fill(&rrect(x, y, w, h, 28.0), rgba(CARD, 1.0));
-    cv.stroke(&rrect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 28.0), rgba(0xffffff, 0.06), 1.0);
-}
+/// Renders every tab with sample data into one tall PNG (for checking the
+/// design off-device).
+pub fn preview(path: &str) -> Result<(), String> {
+    use crate::audio::Jack;
+    use flipad_proto::{HostAction, Pad, Status, button};
 
-fn bar(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, frac: f32, color: u32) {
-    cv.fill(&rrect(x, y, w, h, h / 2.0), rgba(FAINT, 0.6));
-    let f = frac.clamp(0.0, 1.0);
-    if f > 0.0 {
-        cv.fill(&rrect(x, y, (w * f).max(h), h, h / 2.0), rgba(color, 1.0));
-    }
-}
-
-fn level_color(pct: f32) -> u32 {
-    if pct >= 0.9 { BAD } else if pct >= 0.7 { WARN } else { ACCENT }
-}
-
-fn temp_color(t: f32) -> u32 {
-    if t >= 85.0 { BAD } else if t >= 70.0 { WARN } else { DIM }
-}
-
-fn render(cv: &mut Canvas, t: &mut Text, v: &View, battery: (Option<u8>, bool)) {
-    // header
-    t.draw(cv, "Flip Pad", 64.0, 112.0, 56.0, rgba(TEXT, 1.0), true, Align::Left);
-    t.draw(cv, "无线手柄模式", 64.0, 158.0, 28.0, rgba(DIM, 1.0), false, Align::Left);
-
-    let (dot, label) = match &v.phase {
-        Phase::Searching => (WARN, "正在寻找主机…".to_string()),
-        Phase::Connecting => (WARN, format!("正在连接 {}", v.host)),
-        Phase::Connected => (GOOD, format!("已连接 {}", v.host)),
-        Phase::Lost => (WARN, "连接中断，正在重连…".to_string()),
-        Phase::Rejected(r) => (BAD, format!("无法连接：{r}")),
+    let mut text = Text::load()?;
+    let view = View {
+        phase: crate::link::Phase::Connected,
+        host: "my-desktop".into(),
+        rtt_ms: Some(2.4),
+        status: Status { cpu_pct: Some(23), cpu_temp: Some(54.0), gpu_pct: Some(78), gpu_temp: Some(71.0), mem_pct: Some(41) },
+        pad: Pad { buttons: button::SOUTH | button::TR | button::DPAD_LEFT, lx: -14000, ly: 22000, rx: 9000, ry: -4000, lt: 200, rt: 40 },
+        exit_hold: 0.0,
+        rumble: true,
+        jack: Jack { headphones: true, mic: true },
+        audio_live: true,
+        macros: [Some(Duration::from_millis(3200)), None, Some(Duration::from_millis(800)), None],
+        recording: Some(1),
+        playing: Some(2),
+        screen_off: false,
+        last_action: Some((HostAction::VolumeUp, Instant::now())),
     };
-    let lw = t.measure(&label, 30.0, false);
-    let latency = v.rtt_ms.map(|r| format!("{r:.1} ms"));
-    let latw = latency.as_ref().map_or(0.0, |s| t.measure(s, 30.0, true) + 40.0);
-    let pill_w = lw + latw + 96.0;
-    let px = W - 64.0 - pill_w;
-    cv.fill(&rrect(px, 72.0, pill_w, 72.0, 36.0), rgba(CARD, 1.0));
-    cv.fill(&circle(px + 40.0, 108.0, 9.0), rgba(dot, 1.0));
-    t.draw(cv, &label, px + 66.0, 119.0, 30.0, rgba(TEXT, 1.0), false, Align::Left);
-    if let Some(l) = &latency {
-        t.draw(cv, l, W - 64.0 - 36.0, 119.0, 30.0, rgba(dot, 1.0), true, Align::Right);
+    let settings = Settings { turbo: button::SOUTH | crate::settings::TURBO_RT, ..Settings::default() };
+    let tabs = [Tab::Overview, Tab::Quick, Tab::Macros, Tab::Settings];
+    let mut sheet = Pixmap::new(1920, 1080 * (tabs.len() as u32 + 1)).unwrap();
+    for (i, tab) in tabs.iter().chain([Tab::Overview].iter()).enumerate() {
+        let mut cv = Canvas { pm: Pixmap::new(1920, 1080).unwrap(), ts: Transform::identity(), scale: 1.0, ox: 0.0, oy: 0.0 };
+        let mut hits = Vec::new();
+        let v = View { screen_off: i == tabs.len(), ..view.clone() };
+        let flash = (*tab == Tab::Quick).then(|| (Hit::Action(HostAction::PlayPause), Instant::now()));
+        let mut ui = Ui { cv: &mut cv, text: &mut text, hits: &mut hits, flash, now: Instant::now() };
+        panel::render(&mut ui, &v, &settings, *tab, (Some(76), false));
+        sheet.draw_pixmap(0, (i * 1080) as i32, cv.pm.as_ref(), &Default::default(), Default::default(), None);
     }
-
-    controller(cv, t, &v.pad, v.rumble);
-    host_stats(cv, t, v);
-
-    // footer
-    let (bx, by, bw, bh) = EXIT_BTN;
-    let mut fx = 64.0;
-    if let (Some(b), charging) = battery {
-        let s = format!("掌机电量 {b}%{}", if charging { " · 充电中" } else { "" });
-        let c = if b <= 15 { BAD } else { DIM };
-        t.draw(cv, &s, fx, 992.0, 30.0, rgba(c, 1.0), false, Align::Left);
-        fx += t.measure(&s, 30.0, false) + 48.0;
-    }
-    let (audio, color) = match (v.jack.headphones, v.jack.mic, v.audio_live) {
-        (false, _, _) => ("未插耳机".to_string(), DIM),
-        (true, mic, true) => (format!("耳机：主机声音已接通{}", if mic { " · 麦克风已接通" } else { "" }), GOOD),
-        (true, _, false) => ("耳机已插入，连上主机后接通声音".to_string(), WARN),
-    };
-    cv.fill(&circle(fx + 8.0, 981.0, 7.0), rgba(color, 1.0));
-    t.draw(cv, &audio, fx + 28.0, 992.0, 30.0, rgba(if color == DIM { DIM } else { TEXT }, 1.0), false, Align::Left);
-    let hint = "长按 Home + Select 退出，或点右边的按钮";
-    t.draw(cv, hint, 64.0, 1036.0, 26.0, rgba(DIM, 0.8), false, Align::Left);
-    if v.exit_hold > 0.0 {
-        bar(cv, 64.0, 1052.0, 560.0, 8.0, v.exit_hold, BAD);
-    }
-    cv.fill(&rrect(bx, by, bw, bh, bh / 2.0), rgba(BAD, 0.14));
-    cv.stroke(&rrect(bx, by, bw, bh, bh / 2.0), rgba(BAD, 0.6), 2.0);
-    t.draw(cv, "退出", bx + bw / 2.0, by + 62.0, 36.0, rgba(BAD, 1.0), true, Align::Center);
-}
-
-fn controller(cv: &mut Canvas, t: &mut Text, p: &Pad, rumble: bool) {
-    let (x, y, w, h) = (64.0, 200.0, 880.0, 700.0);
-    card(cv, x, y, w, h);
-    t.draw(cv, "手柄", x + 40.0, y + 64.0, 34.0, rgba(TEXT, 1.0), true, Align::Left);
-    if rumble {
-        t.draw(cv, "震动中", x + w - 40.0, y + 64.0, 28.0, rgba(ACCENT, 1.0), true, Align::Right);
-    }
-    let on = |b: u32| p.buttons & b != 0;
-
-    // triggers and bumpers
-    for (i, (name, val, bump, bname)) in
-        [("LT", p.lt, button::TL, "LB"), ("RT", p.rt, button::TR, "RB")].into_iter().enumerate()
-    {
-        let bx = x + 40.0 + i as f32 * 420.0;
-        t.draw(cv, name, bx, y + 132.0, 26.0, rgba(DIM, 1.0), true, Align::Left);
-        bar(cv, bx + 56.0, y + 114.0, 300.0, 22.0, val as f32 / 255.0, ACCENT);
-        let pressed = on(bump);
-        cv.fill(&rrect(bx, y + 160.0, 356.0, 52.0, 26.0), rgba(if pressed { ACCENT } else { FAINT }, if pressed { 0.9 } else { 0.45 }));
-        t.draw(cv, bname, bx + 178.0, y + 196.0, 26.0, rgba(TEXT, 1.0), true, Align::Center);
-    }
-
-    let stick = |cv: &mut Canvas, cx: f32, cy: f32, sx: i16, sy: i16, pressed: bool| {
-        cv.fill(&circle(cx, cy, 88.0), rgba(FAINT, if pressed { 0.9 } else { 0.35 }));
-        cv.stroke(&circle(cx, cy, 88.0), rgba(0xffffff, 0.08), 2.0);
-        let (dx, dy) = (sx as f32 / 32768.0 * 58.0, sy as f32 / 32768.0 * 58.0);
-        cv.fill(&circle(cx + dx, cy + dy, 30.0), rgba(if pressed { ACCENT } else { TEXT }, 0.95));
-    };
-    // Xbox layout: left stick and face buttons on top, d-pad and right stick below
-    stick(cv, x + 190.0, y + 390.0, p.lx, p.ly, on(button::THUMBL));
-    stick(cv, x + 590.0, y + 590.0, p.rx, p.ry, on(button::THUMBR));
-
-    let (dx, dy) = (x + 330.0, y + 590.0);
-    for (bit, ox, oy) in
-        [(button::DPAD_UP, 0.0, -56.0), (button::DPAD_DOWN, 0.0, 56.0), (button::DPAD_LEFT, -56.0, 0.0), (button::DPAD_RIGHT, 56.0, 0.0)]
-    {
-        let pressed = on(bit);
-        cv.fill(&rrect(dx + ox - 27.0, dy + oy - 27.0, 54.0, 54.0, 12.0), rgba(if pressed { ACCENT } else { FAINT }, if pressed { 0.95 } else { 0.5 }));
-    }
-
-    let (fx, fy) = (x + 700.0, y + 380.0);
-    for (bit, label, ox, oy) in [
-        (button::NORTH, "Y", 0.0, -62.0),
-        (button::SOUTH, "A", 0.0, 62.0),
-        (button::WEST, "X", -62.0, 0.0),
-        (button::EAST, "B", 62.0, 0.0),
-    ] {
-        let pressed = on(bit);
-        cv.fill(&circle(fx + ox, fy + oy, 31.0), rgba(if pressed { ACCENT } else { FAINT }, if pressed { 0.95 } else { 0.5 }));
-        t.draw(cv, label, fx + ox, fy + oy + 10.0, 28.0, rgba(TEXT, 1.0), true, Align::Center);
-    }
-
-    for (i, (bit, label)) in [(button::SELECT, "Select"), (button::MODE, "Home"), (button::START, "Start")].into_iter().enumerate() {
-        let cx = x + 340.0 + i as f32 * 104.0;
-        let pressed = on(bit);
-        cv.fill(&rrect(cx - 46.0, y + 360.0, 92.0, 40.0, 20.0), rgba(if pressed { ACCENT } else { FAINT }, if pressed { 0.95 } else { 0.5 }));
-        t.draw(cv, label, cx, y + 387.0, 19.0, rgba(TEXT, 0.9), false, Align::Center);
-    }
-}
-
-fn host_stats(cv: &mut Canvas, t: &mut Text, v: &View) {
-    let (x, y, w, h) = (976.0, 200.0, 880.0, 700.0);
-    card(cv, x, y, w, h);
-    t.draw(cv, "主机", x + 40.0, y + 64.0, 34.0, rgba(TEXT, 1.0), true, Align::Left);
-    if !v.host.is_empty() {
-        t.draw(cv, &v.host, x + w - 40.0, y + 64.0, 28.0, rgba(DIM, 1.0), false, Align::Right);
-    }
-    let s = &v.status;
-    let rows: [(&str, Option<u8>, Option<f32>); 3] =
-        [("CPU", s.cpu_pct, s.cpu_temp), ("GPU", s.gpu_pct, s.gpu_temp), ("内存", s.mem_pct, None)];
-    for (i, (name, pct, temp)) in rows.into_iter().enumerate() {
-        let ry = y + 120.0 + i as f32 * 185.0;
-        t.draw(cv, name, x + 40.0, ry + 40.0, 32.0, rgba(DIM, 1.0), true, Align::Left);
-        let value = pct.map_or("—".to_string(), |p| format!("{p}%"));
-        t.draw(cv, &value, x + 40.0, ry + 112.0, 64.0, rgba(TEXT, 1.0), true, Align::Left);
-        if let Some(tc) = temp {
-            t.draw(cv, &format!("{tc:.0}°C"), x + w - 40.0, ry + 112.0, 44.0, rgba(temp_color(tc), 1.0), true, Align::Right);
-        }
-        let f = pct.map_or(0.0, |p| p as f32 / 100.0);
-        bar(cv, x + 40.0, ry + 136.0, w - 80.0, 14.0, f, level_color(f));
-    }
+    sheet.save_png(path).map_err(|e| e.to_string())
 }

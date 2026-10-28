@@ -9,7 +9,10 @@
 mod audio;
 mod link;
 mod paint;
+mod panel;
 mod plumber;
+mod settings;
+mod shaper;
 mod sleep;
 mod ui;
 
@@ -93,6 +96,8 @@ fn main() {
         view: Mutex::new(View::default()),
         quit,
         jack: Arc::default(),
+        settings: Mutex::new(settings::Settings::load()),
+        cmds: Mutex::default(),
         notify: Box::new(move || {
             let _ = proxy.send_event(());
         }),

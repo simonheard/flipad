@@ -1,6 +1,7 @@
 //! flipad host: turns a handheld on the LAN into a local Xbox 360 controller.
 
 mod audio;
+mod keys;
 mod pad;
 mod stats;
 
@@ -10,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use flipad_proto::{Msg, PORT, Pad, TOKEN_LEN, parse_token, seq_newer};
+use flipad_proto::{HostAction, Msg, PORT, Pad, TOKEN_LEN, parse_token, seq_newer};
 use pad::VirtualPad;
 
 /// No packets for this long: release everything so nothing stays held.
@@ -26,6 +27,8 @@ struct Session {
     name: String,
     pad: VirtualPad,
     jack: (bool, bool),
+    /// Recent action ids; the client sends each action a few times.
+    actions: Vec<u32>,
 }
 
 fn config_dir() -> std::path::PathBuf {
@@ -98,6 +101,13 @@ fn main() -> std::io::Result<()> {
         signal_hook::flag::register(sig, quit.clone())?;
     }
     let audio = audio::Audio::start();
+    let (keys_tx, keys_rx) = std::sync::mpsc::channel::<HostAction>();
+    std::thread::spawn(move || {
+        let mut keys = keys::Keys::new();
+        while let Ok(a) = keys_rx.recv() {
+            keys.run(a);
+        }
+    });
 
     let mut session: Option<Session> = None;
     let mut buf = [0u8; 512];
@@ -112,7 +122,7 @@ fn main() -> std::io::Result<()> {
         if fds[0].revents & libc::POLLIN != 0 {
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
                 let Some(msg) = Msg::decode(&buf[..n]) else { continue };
-                handle(&sock, &mut session, &peer, &audio, &token, &name, msg, from, now);
+                handle(&sock, &mut session, &peer, &audio, &keys_tx, &token, &name, msg, from, now);
             }
         }
 
@@ -144,6 +154,7 @@ fn handle(
     session: &mut Option<Session>,
     peer: &Mutex<Option<SocketAddr>>,
     audio: &audio::Audio,
+    keys: &std::sync::mpsc::Sender<HostAction>,
     token: &[u8; TOKEN_LEN],
     name: &str,
     msg: Msg,
@@ -178,7 +189,7 @@ fn handle(
             };
             let id = random_u32();
             eprintln!("{client} connected from {from}");
-            *session = Some(Session { addr: from, id, seq: None, last_seen: now, name: client, pad, jack: (false, false) });
+            *session = Some(Session { addr: from, id, seq: None, last_seen: now, name: client, pad, jack: (false, false), actions: Vec::new() });
             audio.set(None);
             *peer.lock().unwrap() = Some(from);
             send(sock, from, &Msg::Welcome { session: id, name: name.into() });
@@ -204,6 +215,19 @@ fn handle(
                 *session = None;
                 *peer.lock().unwrap() = None;
                 audio.set(None);
+            }
+        }
+        Msg::Action { session: id, id: action_id, action } => {
+            if let Some(s) = session.as_mut().filter(|s| ours(s, id)) {
+                s.last_seen = now;
+                if !s.actions.contains(&action_id) {
+                    if s.actions.len() >= 16 {
+                        s.actions.remove(0);
+                    }
+                    s.actions.push(action_id);
+                    eprintln!("{}: {action:?}", s.name);
+                    let _ = keys.send(action);
+                }
             }
         }
         Msg::Jack { session: id, headphones, mic } => {

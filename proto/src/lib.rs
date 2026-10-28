@@ -46,6 +46,47 @@ pub struct Pad {
     pub rt: u8,
 }
 
+/// Shortcuts the handheld can trigger on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HostAction {
+    VolumeDown = 1,
+    VolumeUp,
+    Mute,
+    PlayPause,
+    Previous,
+    Next,
+    /// F12: Steam's in-game screenshot.
+    SteamScreenshot,
+    /// Print Screen: the desktop's screenshot tool.
+    Screenshot,
+    AltTab,
+    Escape,
+    ShowDesktop,
+    BigPicture,
+}
+
+impl HostAction {
+    pub const ALL: [HostAction; 12] = [
+        HostAction::VolumeDown,
+        HostAction::VolumeUp,
+        HostAction::Mute,
+        HostAction::PlayPause,
+        HostAction::Previous,
+        HostAction::Next,
+        HostAction::SteamScreenshot,
+        HostAction::Screenshot,
+        HostAction::AltTab,
+        HostAction::Escape,
+        HostAction::ShowDesktop,
+        HostAction::BigPicture,
+    ];
+
+    pub fn from_u8(x: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| *a as u8 == x)
+    }
+}
+
 /// Host machine readings for the handheld's status screen. `None` = unknown.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
@@ -77,6 +118,8 @@ pub enum Msg {
     Bye { session: u32 },
     /// client → host: what is plugged into the handheld's 3.5mm jack.
     Jack { session: u32, headphones: bool, mic: bool },
+    /// client → host: run a shortcut. `id` lets the host drop repeats.
+    Action { session: u32, id: u32, action: HostAction },
 }
 
 mod kind {
@@ -92,6 +135,7 @@ mod kind {
     pub const STATUS: u8 = 10;
     pub const BYE: u8 = 11;
     pub const JACK: u8 = 12;
+    pub const ACTION: u8 = 13;
 }
 
 struct W(Vec<u8>);
@@ -212,6 +256,7 @@ impl Msg {
             Msg::Jack { session, headphones, mic } => {
                 W::new(kind::JACK).u32(*session).u8(*headphones as u8 | (*mic as u8) << 1)
             }
+            Msg::Action { session, id, action } => W::new(kind::ACTION).u32(*session).u32(*id).u8(*action as u8),
         }
         .0
     }
@@ -251,6 +296,7 @@ impl Msg {
                 mem_pct: r.opt_u8()?,
             }),
             kind::BYE => Msg::Bye { session: r.u32()? },
+            kind::ACTION => Msg::Action { session: r.u32()?, id: r.u32()?, action: HostAction::from_u8(r.u8()?)? },
             kind::JACK => {
                 let session = r.u32()?;
                 let bits = r.u8()?;
@@ -300,6 +346,7 @@ mod tests {
             Msg::Bye { session: 3 },
             Msg::Jack { session: 3, headphones: true, mic: false },
             Msg::Jack { session: 4, headphones: false, mic: true },
+            Msg::Action { session: 4, id: 7, action: HostAction::BigPicture },
         ];
         for m in msgs {
             assert_eq!(Msg::decode(&m.encode()), Some(m.clone()), "{m:?}");
