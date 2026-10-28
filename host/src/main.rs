@@ -1,10 +1,12 @@
 //! flipad host: turns a handheld on the LAN into a local Xbox 360 controller.
 
+mod audio;
 mod pad;
 mod stats;
 
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,7 @@ struct Session {
     last_seen: Instant,
     name: String,
     pad: VirtualPad,
+    jack: (bool, bool),
 }
 
 fn config_dir() -> std::path::PathBuf {
@@ -90,9 +93,15 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    let quit = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT, signal_hook::consts::SIGHUP] {
+        signal_hook::flag::register(sig, quit.clone())?;
+    }
+    let audio = audio::Audio::start();
+
     let mut session: Option<Session> = None;
     let mut buf = [0u8; 512];
-    loop {
+    while !quit.load(Ordering::Relaxed) {
         let mut fds = vec![libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
         if let Some(s) = &session {
             fds.push(libc::pollfd { fd: s.pad.fd(), events: libc::POLLIN, revents: 0 });
@@ -103,7 +112,7 @@ fn main() -> std::io::Result<()> {
         if fds[0].revents & libc::POLLIN != 0 {
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
                 let Some(msg) = Msg::decode(&buf[..n]) else { continue };
-                handle(&sock, &mut session, &peer, &token, &name, msg, from, now);
+                handle(&sock, &mut session, &peer, &audio, &token, &name, msg, from, now);
             }
         }
 
@@ -118,11 +127,15 @@ fn main() -> std::io::Result<()> {
                 eprintln!("{} timed out", s.name);
                 session = None;
                 *peer.lock().unwrap() = None;
+                audio.set(None);
             } else if silent > NEUTRAL_AFTER && s.pad.state() != Pad::default() {
                 let _ = s.pad.apply(Pad::default());
             }
         }
     }
+    eprintln!("stopping");
+    audio.shutdown();
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,6 +143,7 @@ fn handle(
     sock: &UdpSocket,
     session: &mut Option<Session>,
     peer: &Mutex<Option<SocketAddr>>,
+    audio: &audio::Audio,
     token: &[u8; TOKEN_LEN],
     name: &str,
     msg: Msg,
@@ -164,7 +178,8 @@ fn handle(
             };
             let id = random_u32();
             eprintln!("{client} connected from {from}");
-            *session = Some(Session { addr: from, id, seq: None, last_seen: now, name: client, pad });
+            *session = Some(Session { addr: from, id, seq: None, last_seen: now, name: client, pad, jack: (false, false) });
+            audio.set(None);
             *peer.lock().unwrap() = Some(from);
             send(sock, from, &Msg::Welcome { session: id, name: name.into() });
         }
@@ -188,6 +203,17 @@ fn handle(
                 eprintln!("{} disconnected", session.as_ref().unwrap().name);
                 *session = None;
                 *peer.lock().unwrap() = None;
+                audio.set(None);
+            }
+        }
+        Msg::Jack { session: id, headphones, mic } => {
+            if let Some(s) = session.as_mut().filter(|s| ours(s, id)) {
+                s.last_seen = now;
+                if s.jack != (headphones, mic) {
+                    s.jack = (headphones, mic);
+                    eprintln!("{}: headphones={headphones} mic={mic}", s.name);
+                    audio.set(Some(audio::Want { ip: from.ip(), headphones, mic }));
+                }
             }
         }
         _ => {}

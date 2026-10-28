@@ -7,3 +7,4 @@ edition.workspace = true
 flipad-proto = { path = "../proto" }
 evdev = "0.13"
 libc = "0.2"
+signal-hook = "0.3"

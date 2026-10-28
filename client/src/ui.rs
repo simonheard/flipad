@@ -206,6 +206,8 @@ pub fn preview(path: &str) -> Result<(), String> {
         pad: Pad { buttons: button::SOUTH | button::TR | button::DPAD_LEFT, lx: -14000, ly: 22000, rx: 9000, ry: -4000, lt: 200, rt: 40 },
         exit_hold: 0.4,
         rumble: true,
+        jack: crate::audio::Jack { headphones: true, mic: true },
+        audio_live: true,
     };
     render(&mut cv, &mut text, &view, (Some(76), false));
     cv.pm.save_png(path).map_err(|e| e.to_string())
@@ -268,11 +270,20 @@ fn render(cv: &mut Canvas, t: &mut Text, v: &View, battery: (Option<u8>, bool)) 
 
     // footer
     let (bx, by, bw, bh) = EXIT_BTN;
+    let mut fx = 64.0;
     if let (Some(b), charging) = battery {
         let s = format!("掌机电量 {b}%{}", if charging { " · 充电中" } else { "" });
         let c = if b <= 15 { BAD } else { DIM };
-        t.draw(cv, &s, 64.0, 992.0, 30.0, rgba(c, 1.0), false, Align::Left);
+        t.draw(cv, &s, fx, 992.0, 30.0, rgba(c, 1.0), false, Align::Left);
+        fx += t.measure(&s, 30.0, false) + 48.0;
     }
+    let (audio, color) = match (v.jack.headphones, v.jack.mic, v.audio_live) {
+        (false, _, _) => ("未插耳机".to_string(), DIM),
+        (true, mic, true) => (format!("耳机：主机声音已接通{}", if mic { " · 麦克风已接通" } else { "" }), GOOD),
+        (true, _, false) => ("耳机已插入，连上主机后接通声音".to_string(), WARN),
+    };
+    cv.fill(&circle(fx + 8.0, 981.0, 7.0), rgba(color, 1.0));
+    t.draw(cv, &audio, fx + 28.0, 992.0, 30.0, rgba(if color == DIM { DIM } else { TEXT }, 1.0), false, Align::Left);
     let hint = "长按 Home + Select 退出，或点右边的按钮";
     t.draw(cv, hint, 64.0, 1036.0, 26.0, rgba(DIM, 0.8), false, Align::Left);
     if v.exit_hold > 0.0 {

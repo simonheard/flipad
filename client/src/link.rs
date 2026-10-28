@@ -14,6 +14,8 @@ use evdev::{
 };
 use flipad_proto::{Msg, PORT, Pad, Status, TOKEN_LEN, button};
 
+use crate::audio::{Audio, Jack, Want};
+
 /// Re-send the current state this often even when nothing changes, so a lost
 /// packet is repaired quickly and the host knows we are alive.
 const KEEPALIVE: Duration = Duration::from_millis(20);
@@ -45,11 +47,15 @@ pub struct View {
     /// 0..1 progress of the exit combo.
     pub exit_hold: f32,
     pub rumble: bool,
+    /// Headset state, and whether audio is being routed (needs a connection).
+    pub jack: Jack,
+    pub audio_live: bool,
 }
 
 pub struct Shared {
     pub view: Mutex<View>,
     pub quit: Arc<AtomicBool>,
+    pub jack: Arc<Mutex<Jack>>,
     /// Called whenever `view` changed.
     pub notify: Box<dyn Fn() + Send + Sync>,
 }
@@ -214,6 +220,11 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
     let mut exit_since: Option<Instant> = None;
     let mut motor = Motor { effect: None };
     let mut buf = [0u8; 512];
+    let latency = std::env::var("FLIPAD_AUDIO_LATENCY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let audio = Audio::start(latency);
+    let mut routed: Option<Want> = None;
+    let mut jack_sent: Option<Jack> = None;
+    let mut last_jack = Instant::now();
     shared.update(|v| v.phase = if host.is_some() { Phase::Connecting } else { Phase::Searching });
 
     let send = |to: SocketAddr, m: &Msg| {
@@ -316,6 +327,12 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
                 last_retry = now;
             }
             (Some(to), Some(id)) => {
+                let jack = *shared.jack.lock().unwrap();
+                if jack_sent != Some(jack) || now.duration_since(last_jack) >= Duration::from_secs(1) {
+                    send(to, &Msg::Jack { session: id, headphones: jack.headphones, mic: jack.mic });
+                    jack_sent = Some(jack);
+                    last_jack = now;
+                }
                 if now.duration_since(last_send) >= KEEPALIVE {
                     seq = seq.wrapping_add(1);
                     send(to, &Msg::State { session: id, seq, pad });
@@ -338,8 +355,23 @@ fn serve(mut dev: RawDevice, cfg: Config, shared: Arc<Shared>, sock: &UdpSocket,
             }
             _ => {}
         }
+
+        let want = host.zip(session).map(|(to, _)| Want { host: to.ip(), jack: *shared.jack.lock().unwrap() });
+        if want != routed {
+            if want.is_none() {
+                jack_sent = None;
+            }
+            routed = want;
+            audio.set(want);
+            let live = want.is_some_and(|w| w.jack.headphones || w.jack.mic);
+            shared.update(|v| {
+                v.jack = want.map_or(*shared.jack.lock().unwrap(), |w| w.jack);
+                v.audio_live = live;
+            });
+        }
     }
 
+    drop(audio);
     motor.play(&mut dev, 0, 0, 0);
     ended.to = host.zip(session);
     Ok(())

@@ -115,6 +115,7 @@ pub fn guard(pid: i32) {
     while Path::new(&format!("/proc/{pid}")).exists() {
         std::thread::sleep(Duration::from_millis(250));
     }
+    crate::audio::restore_quantum();
     match restore() {
         Ok(true) => eprintln!("guard: restored InputPlumber targets after pid {pid} exited"),
         Ok(false) => {}

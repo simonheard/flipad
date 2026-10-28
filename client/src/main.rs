@@ -6,6 +6,7 @@
 //! on-screen button, Steam stopping it, suspend, or a crash via the guard
 //! process) hands them back.
 
+mod audio;
 mod link;
 mod paint;
 mod plumber;
@@ -91,11 +92,20 @@ fn main() {
     let shared = Arc::new(Shared {
         view: Mutex::new(View::default()),
         quit,
+        jack: Arc::default(),
         notify: Box::new(move || {
             let _ = proxy.send_event(());
         }),
     });
     let sleep_lock = sleep::watch(shared.clone());
+    {
+        let s = shared.clone();
+        audio::watch_jack(shared.jack.clone(), move || {
+            let j = *s.jack.lock().unwrap();
+            s.view.lock().unwrap().jack = j;
+            (s.notify)();
+        });
+    }
 
     let token = std::fs::read_to_string(config_dir().join("token")).ok().and_then(|s| parse_token(&s));
     let host = read_host(host_arg);

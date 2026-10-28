@@ -567,11 +567,15 @@ dependencies = [
  "evdev",
  "flipad-proto",
  "libc",
+ "signal-hook",
 ]
 
 [[package]]
 name = "flipad-proto"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "foreign-types"

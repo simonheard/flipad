@@ -8,6 +8,12 @@
 pub const MAGIC: [u8; 4] = *b"FPD1";
 pub const PORT: u16 = 47820;
 pub const TOKEN_LEN: usize = 16;
+/// RTP audio from the host to the handheld's headphone jack.
+pub const AUDIO_PORT: u16 = PORT + 10;
+/// RTP audio from the handheld's headset microphone to the host.
+pub const MIC_PORT: u16 = PORT + 11;
+
+pub mod audio;
 
 /// Bits of `Pad::buttons`.
 pub mod button {
@@ -69,6 +75,8 @@ pub enum Msg {
     Rumble { strong: u16, weak: u16, ms: u16 },
     Status(Status),
     Bye { session: u32 },
+    /// client → host: what is plugged into the handheld's 3.5mm jack.
+    Jack { session: u32, headphones: bool, mic: bool },
 }
 
 mod kind {
@@ -83,6 +91,7 @@ mod kind {
     pub const RUMBLE: u8 = 9;
     pub const STATUS: u8 = 10;
     pub const BYE: u8 = 11;
+    pub const JACK: u8 = 12;
 }
 
 struct W(Vec<u8>);
@@ -200,6 +209,9 @@ impl Msg {
                 .opt_temp(s.gpu_temp)
                 .opt_u8(s.mem_pct),
             Msg::Bye { session } => W::new(kind::BYE).u32(*session),
+            Msg::Jack { session, headphones, mic } => {
+                W::new(kind::JACK).u32(*session).u8(*headphones as u8 | (*mic as u8) << 1)
+            }
         }
         .0
     }
@@ -239,6 +251,11 @@ impl Msg {
                 mem_pct: r.opt_u8()?,
             }),
             kind::BYE => Msg::Bye { session: r.u32()? },
+            kind::JACK => {
+                let session = r.u32()?;
+                let bits = r.u8()?;
+                Msg::Jack { session, headphones: bits & 1 != 0, mic: bits & 2 != 0 }
+            }
             _ => return None,
         })
     }
@@ -281,6 +298,8 @@ mod tests {
             Msg::Rumble { strong: 65535, weak: 0, ms: 200 },
             Msg::Status(Status { cpu_pct: Some(37), cpu_temp: Some(61.5), gpu_pct: None, gpu_temp: Some(-1.2), mem_pct: Some(0) }),
             Msg::Bye { session: 3 },
+            Msg::Jack { session: 3, headphones: true, mic: false },
+            Msg::Jack { session: 4, headphones: false, mic: true },
         ];
         for m in msgs {
             assert_eq!(Msg::decode(&m.encode()), Some(m.clone()), "{m:?}");
