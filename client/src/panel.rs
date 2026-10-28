@@ -15,7 +15,7 @@ use tiny_skia::{FilterQuality, Pixmap, PixmapPaint};
 
 use crate::link::{Phase, View};
 use crate::paint::{Align, Canvas, Text, circle, rgba, rrect};
-use crate::settings::{Addr, MACRO_SLOTS, Mode, Settings, TURBO_LT, TURBO_RT};
+use crate::settings::{Addr, MACRO_SLOTS, Mode, Output, Settings, TURBO_LT, TURBO_RT};
 
 pub const W: f32 = 1920.0;
 const M: f32 = 32.0;
@@ -52,13 +52,11 @@ pub enum Tab {
 /// and the game tab appears while a game plugin is active.
 pub fn tabs(v: &View) -> Vec<(Tab, &'static str)> {
     let mut t = vec![(Tab::Overview, "概览")];
-    if !v.bluetooth {
-        if v.plugin.is_some() {
-            t.push((Tab::Game, "游戏"));
-        }
-        t.push((Tab::Touchpad, "触控板"));
-        t.push((Tab::Quick, "快捷"));
+    if !v.bluetooth && v.plugin.is_some() {
+        t.push((Tab::Game, "游戏"));
     }
+    t.push((Tab::Touchpad, "触控板"));
+    t.push((Tab::Quick, "快捷"));
     t.push((Tab::Macros, "宏 / 连发"));
     t.push((Tab::Settings, "设置"));
     t
@@ -92,6 +90,7 @@ pub enum Hit {
     Mic,
     Latency(u32),
     PointerSpeed(u32),
+    Output(Output),
     OpenSwitcher,
     CloseSwitcher,
     Connect(Target),
@@ -243,7 +242,7 @@ pub fn render(ui: &mut Ui, v: &View, s: &Settings, tab: Tab, battery: (Option<u8
         Tab::Overview => overview(ui, v),
         Tab::Game => game(ui, v),
         Tab::Touchpad => touchpad(ui),
-        Tab::Quick => quick(ui),
+        Tab::Quick => quick(ui, v.bluetooth),
         Tab::Macros => macros(ui, v, s),
         Tab::Settings => settings(ui, v, s),
     }
@@ -545,11 +544,13 @@ fn touchpad(ui: &mut Ui) {
     ui.text("▼", cx + cw / 2.0, sy + sh - 24.0, 30.0, FAINT, false, Align::Center);
 }
 
-fn quick(ui: &mut Ui) {
+fn quick(ui: &mut Ui, bluetooth: bool) {
     let (y0, gap) = (TOP + 8.0, 20.0);
     let tw = (W - 2.0 * M - 3.0 * gap) / 4.0;
     let th = (BOTTOM - 8.0 - y0 - 2.0 * gap) / 3.0;
-    for (i, a) in HostAction::ALL.into_iter().enumerate() {
+    // over Bluetooth only what a keyboard or media keys can do
+    let actions = HostAction::ALL.into_iter().filter(|a| !bluetooth || crate::ble::shortcut(*a).is_some());
+    for (i, a) in actions.enumerate() {
         let (col, row) = ((i % 4) as f32, (i / 4) as f32);
         let (x, y) = (M + col * (tw + gap), y0 + row * (th + gap));
         ui.button2(Hit::Action(a), x, y, tw, th, action_label(a), action_hint(a), 52.0, false, ACCENT);
@@ -641,21 +642,33 @@ fn settings(ui: &mut Ui, v: &View, s: &Settings) {
     let bw = (iw - 16.0) / 2.0;
     ui.button(Hit::Nintendo(false), ix, y + 300.0, bw, 100.0, "Xbox", 40.0, !s.nintendo, ACCENT);
     ui.button(Hit::Nintendo(true), ix + bw + 16.0, y + 300.0, bw, 100.0, "任天堂", 40.0, s.nintendo, ACCENT);
-    ui.switch(Hit::Rumble, ix, y + 450.0, iw, "震动", "游戏的震动传到掌机", s.rumble);
+    ui.switch(Hit::Rumble, ix, y + 420.0, iw, "震动", "游戏的震动传到掌机", s.rumble);
+    ui.text("掌机出声", ix, y + 600.0, 40.0, TEXT, true, Align::Left);
+    let ow = (iw - 200.0 - 32.0) / 3.0;
+    for (i, (label, o)) in [("跟随", Output::Follow), ("耳机", Output::Headphones), ("扬声器", Output::Speaker)].into_iter().enumerate() {
+        let bx = ix + 200.0 + i as f32 * (ow + 16.0);
+        ui.button(Hit::Output(o), bx, y + 556.0, ow, 92.0, label, 36.0, s.output == o, ACCENT);
+    }
+    ui.text("跟随：由掌机决定，插耳机走耳机，否则外放", ix, y + h - 30.0, 26.0, DIM, false, Align::Left);
 
     let x = M + w + 24.0;
     ui.card(x, y, w, h);
     let (ix, iw) = (x + 36.0, w - 72.0);
-    if v.bluetooth {
-        ui.text("Home 组合键", ix, y + 66.0, 42.0, TEXT, true, Align::Left);
-        let lines = [
-            "Home + A / B / X / Y　回放宏 1–4",
-            "Home + ↓　熄屏 / 唤醒",
-            "长按 Home + Select　退出",
-        ];
-        for (i, l) in lines.into_iter().enumerate() {
-            ui.text(l, ix, y + 140.0 + i as f32 * 60.0, 34.0, DIM, false, Align::Left);
+    let speed_row = |ui: &mut Ui, ty: f32| {
+        ui.text("触控板速度", ix, ty, 40.0, TEXT, true, Align::Left);
+        let sw = (iw - 32.0) / 3.0;
+        for (i, (label, pct)) in [("慢", 100), ("中", 160), ("快", 240)].into_iter().enumerate() {
+            let bx = ix + i as f32 * (sw + 16.0);
+            ui.button(Hit::PointerSpeed(pct), bx, ty + 24.0, sw, 92.0, label, 38.0, s.pointer_speed == pct, ACCENT);
         }
+    };
+    if v.bluetooth {
+        ui.text("蓝牙音频", ix, y + 66.0, 42.0, TEXT, true, Align::Left);
+        let lines = ["在电脑的声音设置里选「Flip Pad」作为输出", "声音从左边「掌机出声」选的位置出来", "蓝牙音频延迟较高，玩游戏建议用 Wi-Fi 模式"];
+        for (i, l) in lines.into_iter().enumerate() {
+            ui.text(l, ix, y + 130.0 + i as f32 * 52.0, 30.0, DIM, false, Align::Left);
+        }
+        speed_row(ui, y + 400.0);
         return;
     }
     ui.switch(Hit::Audio, ix, y + 20.0, iw, "主机声音", "插上耳机时传来电脑的声音", s.audio);
@@ -666,12 +679,7 @@ fn settings(ui: &mut Ui, v: &View, s: &Settings) {
         let bx = ix + i as f32 * (lw + 16.0);
         ui.button(Hit::Latency(ms), bx, y + 376.0, lw, 92.0, &format!("{ms}ms"), 36.0, s.audio_latency_ms == ms, ACCENT);
     }
-    ui.text("触控板速度", ix, y + 540.0, 40.0, TEXT, true, Align::Left);
-    let sw = (iw - 32.0) / 3.0;
-    for (i, (label, pct)) in [("慢", 100), ("中", 160), ("快", 240)].into_iter().enumerate() {
-        let bx = ix + i as f32 * (sw + 16.0);
-        ui.button(Hit::PointerSpeed(pct), bx, y + 564.0, sw, 92.0, label, 38.0, s.pointer_speed == pct, ACCENT);
-    }
+    speed_row(ui, y + 540.0);
 }
 
 fn controller(ui: &mut Ui, p: &Pad, w: f32) {

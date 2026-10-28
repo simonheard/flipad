@@ -189,6 +189,7 @@ impl App {
                 sh.pointer(PointerOp::Buttons(self.base_buttons()));
             }
             Hit::PointerSpeed(p) => set(&|s| s.pointer_speed = p),
+            Hit::Output(o) => set(&|s| s.output = o),
             Hit::OpenSwitcher => self.switcher = true,
             Hit::CloseSwitcher => self.switcher = false,
             Hit::Connect(t) => {

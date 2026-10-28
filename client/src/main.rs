@@ -131,6 +131,26 @@ fn main() {
         }),
     });
     let sleep_lock = sleep::watch(shared.clone());
+    // debugging aid: SIGUSR2 runs the touchpad and shortcut paths without touch
+    {
+        let probe = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, probe.clone());
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            while !s.quit.load(Ordering::Relaxed) {
+                if probe.swap(false, Ordering::Relaxed) {
+                    eprintln!("self-test: pointer +120 then back, volume up then down");
+                    s.pointer(link::PointerOp::Move(120.0, 0.0));
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    s.pointer(link::PointerOp::Move(-120.0, 0.0));
+                    s.command(link::Cmd::Action(flipad_proto::HostAction::VolumeUp));
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    s.command(link::Cmd::Action(flipad_proto::HostAction::VolumeDown));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
     // debugging aid: SIGUSR1 flips between Wi-Fi and Bluetooth like the panel does
     {
         let flip = Arc::new(AtomicBool::new(false));

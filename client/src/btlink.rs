@@ -11,7 +11,8 @@ use evdev::{EventType, InputEvent};
 use flipad_proto::Pad;
 
 use crate::ble::Peripheral;
-use crate::link::{BtHost, Cmd, Motor, Phase, Shared, View, apply_event};
+use crate::ble::shortcut;
+use crate::link::{BtHost, Cmd, Motor, Phase, PointerOp, Shared, View, apply_event};
 use crate::settings::{Addr, Mode, addr_str, load_macros, parse_addr, save_macros};
 use crate::shaper::{Event, Shaper};
 
@@ -60,6 +61,13 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
     let mut last_poll = Instant::now() - Duration::from_secs(10);
     let mut last_battery = Instant::now();
     let mut was_subscribed = false;
+    // touchpad: current buttons and sub-unit leftovers (x, y, wheel, pan)
+    let mut mouse_buttons: u8 = 0;
+    let mut rest = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // shortcut keys go up again shortly after going down
+    let mut release_at: Option<Instant> = None;
+    let mut router = crate::audio::BtRouter::default();
+    let mut audio_asked: Option<crate::settings::Addr> = None;
     let mut hosts = load_hosts();
     let mut target = shared.settings.lock().unwrap().bt_target;
     ble.apply_target(target.as_ref(), &hosts.iter().map(|h| h.0).collect::<Vec<_>>());
@@ -85,9 +93,8 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
             ble.apply_target(target.as_ref(), &hosts.iter().map(|h| h.0).collect::<Vec<_>>());
             last_poll = now - Duration::from_secs(10);
         }
-        let wait = shaper
-            .deadline(&settings, now)
-            .map_or(250, |d| d.saturating_duration_since(now).as_millis().clamp(1, 250) as i32);
+        let deadline = [shaper.deadline(&settings, now), release_at].into_iter().flatten().min();
+        let wait = deadline.map_or(250, |d| d.saturating_duration_since(now).as_millis().clamp(1, 250) as i32);
         let mut fds = [
             libc::pollfd { fd: dev.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
@@ -108,13 +115,70 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
                 }
             }
         }
-        // the touchpad has no host to talk to here
-        shared.pointer.lock().unwrap().clear();
+        // touchpad → Bluetooth mouse
+        let ops: Vec<PointerOp> = std::mem::take(&mut *shared.pointer.lock().unwrap());
+        if !ops.is_empty() {
+            let speed = settings.pointer_speed as f32 / 100.0;
+            let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let mut flush = |acc: &mut (f32, f32, f32, f32), buttons: u8, force: bool| {
+                let take = |v: f32, rest: &mut f32, scale: f32, max: f32| {
+                    let t = v / scale + *rest;
+                    let whole = t.trunc().clamp(-max, max);
+                    *rest = t - whole;
+                    whole
+                };
+                let dx = take(acc.0 * speed, &mut rest.0, 1.0, 32767.0) as i16;
+                let dy = take(acc.1 * speed, &mut rest.1, 1.0, 32767.0) as i16;
+                // wheel arrives in 1/120 notches; the report carries whole notches
+                let wheel = take(acc.2, &mut rest.2, 120.0, 127.0) as i8;
+                let pan = take(acc.3, &mut rest.3, 120.0, 127.0) as i8;
+                *acc = (0.0, 0.0, 0.0, 0.0);
+                if force || dx != 0 || dy != 0 || wheel != 0 || pan != 0 {
+                    ble.send_mouse(buttons, dx, dy, wheel, pan);
+                }
+            };
+            for op in ops {
+                match op {
+                    PointerOp::Move(x, y) => {
+                        acc.0 += x;
+                        acc.1 += y;
+                    }
+                    PointerOp::Scroll(v, h) => {
+                        acc.2 += v;
+                        acc.3 += h;
+                    }
+                    PointerOp::Buttons(b) => {
+                        flush(&mut acc, mouse_buttons, false);
+                        mouse_buttons = b;
+                        flush(&mut acc, b, true);
+                    }
+                }
+            }
+            flush(&mut acc, mouse_buttons, false);
+        }
+        if release_at.is_some_and(|t| now >= t) {
+            release_at = None;
+            ble.send_media(0);
+            ble.send_keys(0, &[]);
+        }
+        let mut run_shortcut = |a: flipad_proto::HostAction| {
+            if let Some((media, mods, keys)) = shortcut(a) {
+                if media != 0 {
+                    ble.send_media(media);
+                }
+                if mods != 0 || !keys.is_empty() {
+                    ble.send_keys(mods, keys);
+                }
+                release_at = Some(now + Duration::from_millis(40));
+                shared.update(|v| v.last_action = Some((a, now)));
+            }
+        };
 
         let mut macros_changed = false;
         for c in std::mem::take(&mut *shared.cmds.lock().unwrap()) {
             match c {
-                Cmd::Action(_) | Cmd::PluginButton(_) => {}
+                Cmd::Action(a) => run_shortcut(a),
+                Cmd::PluginButton(_) => {}
                 Cmd::Record(i) => shaper.start_recording(i, now),
                 Cmd::StopRecording => macros_changed |= shaper.stop_recording(now).is_some(),
                 Cmd::Play(i) => shaper.play(i, now),
@@ -131,7 +195,7 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
         }
         for e in events.drain(..) {
             match e {
-                Event::Action(_) => {}
+                Event::Action(a) => run_shortcut(a),
                 Event::PlayMacro(i) => shaper.play(i, now),
                 Event::ToggleScreen => shared.update(|v| v.screen_off = !v.screen_off),
                 Event::Quit => shared.quit.store(true, Ordering::Relaxed),
@@ -178,6 +242,16 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
             let list: Vec<BtHost> =
                 hosts.iter().map(|(a, n)| BtHost { addr: *a, name: n.clone(), connected: ble.is_connected(a) }).collect();
             let host = list.iter().find(|h| h.connected).map(|h| h.name.clone());
+            // sound arrives over A2DP (the host opens it); send it to the
+            // chosen output, or turn it away when host sound is off
+            let connected = list.iter().find(|h| h.connected).map(|h| h.addr);
+            if connected.is_none() || settings.audio {
+                audio_asked = None;
+            } else if audio_asked != connected {
+                audio_asked = connected;
+                ble.disconnect_audio(connected.unwrap());
+            }
+            router.update(settings.output);
             let phase = match (&host, subscribed) {
                 (Some(_), true) => Phase::Connected,
                 (Some(_), false) => Phase::Connecting,
@@ -215,6 +289,9 @@ pub fn run(dev: &mut RawDevice, wake: &OwnedFd, shared: Arc<Shared>) -> std::io:
     // release everything before going away so nothing stays held on the host
     if ble.subscribed() {
         ble.send(&Pad::default());
+        ble.send_mouse(0, 0, 0, 0, 0);
+        ble.send_media(0);
+        ble.send_keys(0, &[]);
     }
     motor.play(dev, 0, 0, 0);
     Ok(())

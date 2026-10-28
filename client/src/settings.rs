@@ -17,6 +17,16 @@ pub enum Mode {
     Bluetooth,
 }
 
+/// Where the handheld plays sound coming from the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Output {
+    /// The handheld's own default (headphones when plugged in, else speaker).
+    #[default]
+    Follow,
+    Headphones,
+    Speaker,
+}
+
 /// Bluetooth address as text ("AA:BB:CC:DD:EE:FF"), fixed size so Settings stays Copy.
 pub type Addr = [u8; 17];
 
@@ -47,11 +57,12 @@ pub struct Settings {
     pub turbo_hz: u32,
     /// Touchpad pointer speed in percent.
     pub pointer_speed: u32,
+    pub output: Output,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mode: Mode::Wifi, bt_target: None, nintendo: false, rumble: true, audio: true, mic: true, audio_latency_ms: 30, turbo: 0, turbo_hz: 15, pointer_speed: 160 }
+        Self { mode: Mode::Wifi, bt_target: None, nintendo: false, rumble: true, audio: true, mic: true, audio_latency_ms: 30, turbo: 0, turbo_hz: 15, pointer_speed: 160, output: Output::Follow }
     }
 }
 
@@ -78,6 +89,13 @@ impl Settings {
                 "audio_latency_ms" => s.audio_latency_ms = n.unwrap_or(30).clamp(10, 200),
                 "turbo" => s.turbo = n.unwrap_or(0),
                 "turbo_hz" => s.turbo_hz = n.unwrap_or(15).clamp(2, 30),
+                "output" => {
+                    s.output = match v {
+                        "headphones" => Output::Headphones,
+                        "speaker" => Output::Speaker,
+                        _ => Output::Follow,
+                    }
+                }
                 "pointer_speed" => s.pointer_speed = n.unwrap_or(160).clamp(20, 500),
                 _ => {}
             }
@@ -87,7 +105,7 @@ impl Settings {
 
     pub fn save(&self) {
         let text = format!(
-            "mode={}\nbt_target={}\nnintendo={}\nrumble={}\naudio={}\nmic={}\naudio_latency_ms={}\nturbo={}\nturbo_hz={}\npointer_speed={}\n",
+            "mode={}\nbt_target={}\nnintendo={}\nrumble={}\naudio={}\nmic={}\naudio_latency_ms={}\nturbo={}\nturbo_hz={}\npointer_speed={}\noutput={}\n",
             if self.mode == Mode::Bluetooth { "bluetooth" } else { "wifi" },
             self.bt_target.as_ref().map_or("", addr_str),
             self.nintendo,
@@ -97,7 +115,12 @@ impl Settings {
             self.audio_latency_ms,
             self.turbo,
             self.turbo_hz,
-            self.pointer_speed
+            self.pointer_speed,
+            match self.output {
+                Output::Follow => "follow",
+                Output::Headphones => "headphones",
+                Output::Speaker => "speaker",
+            }
         );
         let _ = std::fs::create_dir_all(dir());
         let _ = std::fs::write(dir().join("settings"), text);

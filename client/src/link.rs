@@ -573,7 +573,9 @@ fn serve(
         // headset routing follows the jack, filtered by the panel switches
         let jack = {
             let j = *shared.jack.lock().unwrap();
-            Jack { headphones: j.headphones && settings.audio, mic: j.mic && settings.mic }
+            // "speaker" plays the host even without headphones plugged in
+            let play = j.headphones || settings.output == crate::settings::Output::Speaker;
+            Jack { headphones: play && settings.audio, mic: j.mic && settings.mic }
         };
         match (host, session) {
             (None, _) if now.duration_since(last_retry) >= RETRY => {
@@ -613,7 +615,7 @@ fn serve(
             _ => {}
         }
 
-        let want = host.zip(session).map(|(to, _)| Want { host: to.ip(), jack });
+        let want = host.zip(session).map(|(to, _)| Want { host: to.ip(), jack, output: settings.output });
         if want != routed {
             if want.is_none() {
                 jack_sent = None;

@@ -22,6 +22,9 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 pub const NAME: &str = "Flip Pad";
 const APP: &str = "/flipad";
 const INPUT: &str = "/flipad/hid/input";
+const MOUSE: &str = "/flipad/hid2/mouse";
+const MEDIA: &str = "/flipad/hid2/media";
+const KEYS: &str = "/flipad/hid2/keys";
 const BATTERY_LEVEL: &str = "/flipad/battery/level";
 const ADV: &str = "/flipad_adv";
 const AGENT: &str = "/flipad_agent";
@@ -67,6 +70,63 @@ pub const REPORT_MAP: &[u8] = &[
     0xC0,
     0xC0,
 ];
+
+/// Second HID service: mouse (report 2), media keys (4) and keyboard (5),
+/// for the touchpad and shortcuts. Kept apart from the gamepad's service so
+/// that one stays byte-for-byte what an Xbox controller reports.
+#[rustfmt::skip]
+pub const EXTRAS_MAP: &[u8] = &[
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, // Mouse, report 2
+    0x09, 0x01, 0xA1, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02,
+    0x75, 0x05, 0x95, 0x01, 0x81, 0x03,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06,
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,             // wheel
+    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, // AC Pan
+    0xC0, 0xC0,
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x04, // Consumer, report 4
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x06,
+    0x09, 0xE9, 0x09, 0xEA, 0x09, 0xE2, 0x09, 0xCD, 0x09, 0xB5, 0x09, 0xB6, 0x81, 0x02,
+    0x75, 0x02, 0x95, 0x01, 0x81, 0x03,
+    0xC0,
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x05, // Keyboard, report 5
+    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x03,
+    0x05, 0x07, 0x19, 0x00, 0x29, 0xFF, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00,
+    0xC0,
+];
+
+/// Media keys in the consumer report's bit order.
+pub mod media {
+    pub const VOLUME_UP: u8 = 1 << 0;
+    pub const VOLUME_DOWN: u8 = 1 << 1;
+    pub const MUTE: u8 = 1 << 2;
+    pub const PLAY_PAUSE: u8 = 1 << 3;
+    pub const NEXT: u8 = 1 << 4;
+    pub const PREVIOUS: u8 = 1 << 5;
+}
+
+/// What a shortcut becomes over Bluetooth: media bits, or keyboard
+/// modifiers + key usages. None when it needs the host service.
+pub fn shortcut(a: flipad_proto::HostAction) -> Option<(u8, u8, &'static [u8])> {
+    use flipad_proto::HostAction as A;
+    const ALT: u8 = 0x04;
+    const GUI: u8 = 0x08;
+    Some(match a {
+        A::VolumeUp => (media::VOLUME_UP, 0, &[]),
+        A::VolumeDown => (media::VOLUME_DOWN, 0, &[]),
+        A::Mute => (media::MUTE, 0, &[]),
+        A::PlayPause => (media::PLAY_PAUSE, 0, &[]),
+        A::Next => (media::NEXT, 0, &[]),
+        A::Previous => (media::PREVIOUS, 0, &[]),
+        A::SteamScreenshot => (0, 0, &[0x45]),   // F12
+        A::Screenshot => (0, 0, &[0x46]),        // Print Screen
+        A::AltTab => (0, ALT, &[0x2B]),          // Tab
+        A::Escape => (0, 0, &[0x29]),
+        A::ShowDesktop => (0, GUI, &[0x07]),     // D
+        A::BigPicture => return None,
+    })
+}
 
 /// Xbox BLE button bit for each of our button bits.
 const BUTTONS: [(u32, u16); 11] = [
@@ -304,6 +364,10 @@ pub struct Peripheral {
     peer: Arc<Mutex<Option<OwnedObjectPath>>>,
     /// Hosts whose Blocked flag we manage, unblocked again on exit.
     blocked: Mutex<Vec<Addr>>,
+    /// Mouse, media and keyboard input reports: (path, value, subscribed).
+    extras: Vec<(&'static str, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>)>,
+    /// Adapter's classic-BT connectability before we opened it for audio.
+    was_connectable: Option<bool>,
 }
 
 fn adapter(conn: &Connection, iface: &'static str) -> zbus::Result<Proxy<'static>> {
@@ -386,6 +450,64 @@ impl Peripheral {
             },
         )?;
         os.at("/flipad/hid/output/ref", Desc { uuid: "2908", chr: "/flipad/hid/output", value: vec![3, 2] })?;
+        let extras: [(&str, u8, usize); 3] = [(MOUSE, 2, 7), (MEDIA, 4, 1), (KEYS, 5, 8)];
+        os.at("/flipad/hid2", Service { uuid: "1812" })?;
+        os.at(
+            "/flipad/hid2/info",
+            Chr {
+                uuid: "2a4a",
+                service: "/flipad/hid2",
+                flags: &["read"],
+                value: fixed(&[0x11, 0x01, 0x00, 0x02]),
+                notifying: None,
+                on_write: None,
+                peer: peer.clone(),
+            },
+        )?;
+        os.at(
+            "/flipad/hid2/map",
+            Chr {
+                uuid: "2a4b",
+                service: "/flipad/hid2",
+                flags: &["read", "encrypt-read"],
+                value: fixed(EXTRAS_MAP),
+                notifying: None,
+                on_write: None,
+                peer: peer.clone(),
+            },
+        )?;
+        os.at(
+            "/flipad/hid2/control",
+            Chr {
+                uuid: "2a4c",
+                service: "/flipad/hid2",
+                flags: &["write-without-response"],
+                value: fixed(&[0]),
+                notifying: None,
+                on_write: None,
+                peer: peer.clone(),
+            },
+        )?;
+        let mut extra_values = Vec::new();
+        for (path, id, len) in extras {
+            let value = Arc::new(Mutex::new(vec![0u8; len]));
+            let notifying = Arc::new(AtomicBool::new(false));
+            os.at(
+                path,
+                Chr {
+                    uuid: "2a4d",
+                    service: "/flipad/hid2",
+                    flags: &["read", "notify", "encrypt-read"],
+                    value: value.clone(),
+                    notifying: Some(notifying.clone()),
+                    on_write: None,
+                    peer: peer.clone(),
+                },
+            )?;
+            let refpath: &'static str = Box::leak(format!("{path}/ref").into_boxed_str());
+            os.at(refpath, Desc { uuid: "2908", chr: path, value: vec![id, 1] })?;
+            extra_values.push((path, value, notifying));
+        }
         os.at("/flipad/battery", Service { uuid: "180f" })?;
         os.at(
             BATTERY_LEVEL,
@@ -416,6 +538,10 @@ impl Peripheral {
         let _ = props.set("org.bluez.Adapter1".try_into()?, "Alias", Value::from(NAME));
         let _ = props.set("org.bluez.Adapter1".try_into()?, "Powered", Value::from(true));
         let _ = props.set("org.bluez.Adapter1".try_into()?, "Pairable", Value::from(true));
+        // accept classic connections too, so the host can stream audio (A2DP)
+        let was_connectable: Option<bool> =
+            props.get("org.bluez.Adapter1".try_into()?, "Connectable").ok().and_then(|v| bool::try_from(v).ok());
+        let _ = props.set("org.bluez.Adapter1".try_into()?, "Connectable", Value::from(true));
 
         let agents = Proxy::new(&conn, "org.bluez", "/org/bluez", "org.bluez.AgentManager1")?;
         let agent_path = ObjectPath::try_from(AGENT)?;
@@ -438,7 +564,7 @@ impl Peripheral {
             }
         });
 
-        Ok(Self { conn, input_notifying, input_value, battery, rumble: rumble_rx, peer, blocked: Mutex::default() })
+        Ok(Self { conn, input_notifying, input_value, battery, rumble: rumble_rx, peer, blocked: Mutex::default(), extras: extra_values, was_connectable })
     }
 
     /// True once a host has subscribed to the input report.
@@ -459,6 +585,17 @@ impl Peripheral {
     fn device(&self, addr: &Addr) -> Option<zbus::blocking::fdo::PropertiesProxy<'static>> {
         let path = format!("/org/bluez/hci0/dev_{}", addr_str(addr).replace(':', "_"));
         zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez").ok()?.path(path).ok()?.build().ok()
+    }
+
+    /// Drops the host's audio stream to us (A2DP) when sound is switched off.
+    pub fn disconnect_audio(&self, addr: Addr) {
+        let conn = self.conn.clone();
+        std::thread::spawn(move || {
+            let path = format!("/org/bluez/hci0/dev_{}", addr_str(&addr).replace(':', "_"));
+            if let Ok(p) = Proxy::new(&conn, "org.bluez", path, "org.bluez.Device1") {
+                let _ = p.call_method("DisconnectProfile", &("0000110a-0000-1000-8000-00805f9b34fb",));
+            }
+        });
     }
 
     /// Whether a known host is connected right now.
@@ -495,6 +632,38 @@ impl Peripheral {
         }
     }
 
+    fn send_extra(&self, path: &str, data: &[u8]) {
+        if let Some((_, value, subscribed)) = self.extras.iter().find(|e| e.0 == path)
+            && subscribed.load(Ordering::Relaxed)
+        {
+            self.notify(path, value, data);
+        }
+    }
+
+    /// Relative mouse report: buttons (bit 0 left, 1 right, 2 middle), motion, wheel notches.
+    pub fn send_mouse(&self, buttons: u8, dx: i16, dy: i16, wheel: i8, pan: i8) {
+        let mut r = [0u8; 7];
+        r[0] = buttons & 7;
+        r[1..3].copy_from_slice(&dx.to_le_bytes());
+        r[3..5].copy_from_slice(&dy.to_le_bytes());
+        r[5] = wheel as u8;
+        r[6] = pan as u8;
+        self.send_extra(MOUSE, &r);
+    }
+
+    pub fn send_media(&self, bits: u8) {
+        self.send_extra(MEDIA, &[bits]);
+    }
+
+    pub fn send_keys(&self, modifiers: u8, keys: &[u8]) {
+        let mut r = [0u8; 8];
+        r[0] = modifiers;
+        for (i, k) in keys.iter().take(6).enumerate() {
+            r[2 + i] = *k;
+        }
+        self.send_extra(KEYS, &r);
+    }
+
     pub fn set_battery(&self, pct: u8) {
         if self.battery.lock().unwrap().first() != Some(&pct) {
             self.notify(BATTERY_LEVEL, &self.battery, &[pct]);
@@ -527,6 +696,14 @@ impl Drop for Peripheral {
         restore_alias();
         let known = std::mem::take(&mut *self.blocked.lock().unwrap());
         self.apply_target(None, &known);
+        if let Some(c) = self.was_connectable
+            && let Ok(b) = zbus::blocking::fdo::PropertiesProxy::builder(&self.conn).destination("org.bluez")
+            && let Ok(b) = b.path("/org/bluez/hci0")
+            && let Ok(props) = b.build()
+            && let Ok(name) = "org.bluez.Adapter1".try_into()
+        {
+            let _ = props.set(name, "Connectable", Value::from(c));
+        }
         // tell the host right away instead of letting the link time out
         if let Some(dev) = self.peer.lock().unwrap().take()
             && let Ok(p) = Proxy::new(&self.conn, "org.bluez", dev, "org.bluez.Device1")
@@ -598,6 +775,34 @@ mod tests {
         assert_eq!(depth, 0);
         assert_eq!(input1, 16 * 8);
         assert_eq!(output3, 8 * 8);
+    }
+
+    #[test]
+    fn extras_map_sizes() {
+        let (mut i, mut depth, mut size, mut count, mut id) = (0, 0i32, 0u32, 0u32, 0u8);
+        let mut bits = std::collections::HashMap::new();
+        while i < EXTRAS_MAP.len() {
+            let b = EXTRAS_MAP[i];
+            let n = match b & 3 { 3 => 4, k => k as usize };
+            let mut data = 0u32;
+            for k in 0..n {
+                data |= (EXTRAS_MAP[i + 1 + k] as u32) << (8 * k);
+            }
+            match b & 0xFC {
+                0xA0 => depth += 1,
+                0xC0 => depth -= 1,
+                0x74 => size = data,
+                0x94 => count = data,
+                0x84 => id = data as u8,
+                0x80 => *bits.entry(id).or_insert(0) += size * count,
+                _ => {}
+            }
+            i += 1 + n;
+        }
+        assert_eq!(depth, 0);
+        assert_eq!(bits[&2], 7 * 8, "mouse");
+        assert_eq!(bits[&4], 8, "media");
+        assert_eq!(bits[&5], 8 * 8, "keyboard");
     }
 
     #[test]

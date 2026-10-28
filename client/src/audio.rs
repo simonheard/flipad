@@ -12,6 +12,8 @@ use evdev::raw_stream::RawDevice;
 use flipad_proto::audio::{Channels, PwProcess, node_names, receiver_conf, sender_conf};
 use flipad_proto::{AUDIO_PORT, MIC_PORT};
 
+use crate::settings::Output;
+
 const JACK_NAME: &str = "RetroidPocket Headset Jack";
 /// Graph cycle while streaming. Pocknix pins 1024 frames (~21 ms), which makes
 /// the headphone device alone slower than the jitter buffer; 512 measured
@@ -112,6 +114,16 @@ fn open_jack() -> Option<RawDevice> {
 pub struct Want {
     pub host: IpAddr,
     pub jack: Jack,
+    pub output: Output,
+}
+
+/// The handheld sink to play into for `output`; None = its default.
+pub fn sink_for(output: Output) -> Option<String> {
+    match output {
+        Output::Follow => None,
+        Output::Headphones => find_node("sinks", "Headphones"),
+        Output::Speaker => find_node("sinks", "Speaker"),
+    }
 }
 
 pub struct Audio {
@@ -143,13 +155,13 @@ impl Drop for Audio {
 }
 
 /// First node of `kind` whose name contains `hint`.
-fn find_node(kind: &str, hint: &str) -> Option<String> {
+pub fn find_node(kind: &str, hint: &str) -> Option<String> {
     node_names(kind).into_iter().find(|n| n.contains(hint) && !n.ends_with(".monitor"))
 }
 
 fn run(rx: Receiver<Option<Want>>, latency_ms: u32) {
     let mut want: Option<Want> = None;
-    let mut playing: Option<(IpAddr, PwProcess)> = None;
+    let mut playing: Option<((IpAddr, Output), PwProcess)> = None;
     let mut sending: Option<(IpAddr, PwProcess)> = None;
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
@@ -162,27 +174,29 @@ fn run(rx: Receiver<Option<Want>>, latency_ms: u32) {
             }
         }
 
-        let hp = want.filter(|w| w.jack.headphones).map(|w| w.host);
-        if playing.as_mut().is_some_and(|(ip, p)| Some(*ip) != hp || !p.alive()) {
+        let hp = want.filter(|w| w.jack.headphones).map(|w| (w.host, w.output));
+        if playing.as_mut().is_some_and(|(key, p)| Some(*key) != hp || !p.alive()) {
             playing = None;
             restore_quantum();
             eprintln!("audio: headphones stream stopped");
         }
         if playing.is_none()
-            && let Some(ip) = hp
+            && let Some(key) = hp
         {
-            let target = find_node("sinks", "Headphones").unwrap_or_default();
-            let props = [
+            let target = sink_for(key.1);
+            let mut props = vec![
                 ("node.name", "flipad_from_host"),
                 ("node.description", "Flip Pad 主机音频"),
                 ("media.class", "Stream/Output/Audio"),
-                ("target.object", target.as_str()),
             ];
+            if let Some(t) = &target {
+                props.push(("target.object", t.as_str()));
+            }
             lower_quantum();
             match PwProcess::spawn("flipad-headphones", &receiver_conf(AUDIO_PORT, latency_ms, Channels::Stereo, &props)) {
                 Ok(p) => {
                     eprintln!("audio: playing host audio into {target:?}");
-                    playing = Some((ip, p));
+                    playing = Some((key, p));
                 }
                 Err(e) => eprintln!("audio: {e}"),
             }
@@ -214,3 +228,52 @@ fn run(rx: Receiver<Option<Want>>, latency_ms: u32) {
         }
     }
 }
+
+/// Incoming Bluetooth audio (A2DP) streams, by PipeWire node id. They exist
+/// only while the host is actually sending sound.
+fn bluetooth_streams() -> Vec<u32> {
+    let out = std::process::Command::new("pw-cli").args(["ls", "Node"]).stderr(std::process::Stdio::null()).output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let mut ids = Vec::new();
+    let mut current: Option<u32> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("id ") {
+            current = rest.split(',').next().and_then(|n| n.trim().parse().ok());
+        } else if t.starts_with("node.name = \"bluez_input.")
+            && let Some(id) = current
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Points incoming Bluetooth audio at the chosen output (or leaves it to the
+/// handheld's default for `Follow`).
+#[derive(Default)]
+pub struct BtRouter {
+    applied: std::collections::HashMap<u32, Output>,
+}
+
+impl BtRouter {
+    pub fn update(&mut self, output: Output) {
+        let streams = bluetooth_streams();
+        self.applied.retain(|id, _| streams.contains(id));
+        for id in streams {
+            if self.applied.get(&id) == Some(&output) {
+                continue;
+            }
+            let id_s = id.to_string();
+            let mut cmd = std::process::Command::new("pw-metadata");
+            match sink_for(output) {
+                Some(sink) => cmd.args([id_s.as_str(), "target.object", sink.as_str()]),
+                None => cmd.args(["-d", id_s.as_str(), "target.object"]),
+            };
+            let ok = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+            eprintln!("audio: bluetooth stream {id} -> {output:?} ({})", if ok { "ok" } else { "failed" });
+            self.applied.insert(id, output);
+        }
+    }
+}
+

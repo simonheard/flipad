@@ -1,6 +1,7 @@
 //! flipad host: turns a handheld on the LAN into a local Xbox 360 controller.
 
 mod audio;
+mod btaudio;
 mod keys;
 mod mouse;
 mod pad;
@@ -111,6 +112,7 @@ fn main() -> std::io::Result<()> {
             keys.run(job);
         }
     });
+    std::thread::Builder::new().name("btaudio".into()).spawn(btaudio::run_forever)?;
     let (plugin_tx, plugin_rx) = std::sync::mpsc::channel::<(String, u16)>();
     {
         let (sock, peer, keys) = (sock.try_clone()?, peer.clone(), keys_tx.clone());
