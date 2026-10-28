@@ -849,17 +849,6 @@ const SCENES: [(&str, f32, f32, SceneFn); 10] = [
     ("10_end", 6.0, 6.0, scene_end),
 ];
 
-fn chip(st: &mut Studio, pm: &mut Pixmap, s: &str, x: f32, y: f32) -> f32 {
-    let w = st.text.measure(s, 34.0, true) + 52.0;
-    let mut paint = Paint { anti_alias: true, ..Paint::default() };
-    paint.set_color(rgba(ACCENT, 0.16));
-    pm.fill_path(&rrect(x, y, w, 64.0, 32.0), &paint, FillRule::Winding, Transform::identity(), None);
-    paint.set_color(rgba(ACCENT, 0.6));
-    pm.stroke_path(&rrect(x, y, w, 64.0, 32.0), &paint, &Stroke { width: 2.0, ..Stroke::default() }, Transform::identity(), None);
-    text(st, pm, s, x + 26.0, y + 44.0, 34.0, TEXT, 1.0, true, Align::Left);
-    w
-}
-
 /// The video cover: the device square on, title on the left.
 fn cover(st: &mut Studio) -> Pixmap {
     let mut pm = Pixmap::new(W, H).unwrap();
@@ -883,18 +872,9 @@ fn cover(st: &mut Studio) -> Pixmap {
         pm.fill_rect(tiny_skia::Rect::from_xywh(0.0, 0.0, 900.0, H as f32).unwrap(), &paint, Transform::identity(), None);
     }
     let x = 110.0;
-    text(st, &mut pm, "PS5 打包了，影之刃零憋不住了", x, 250.0, 46.0, ACCENT, 1.0, true, Align::Left);
-    text(st, &mut pm, "掌机秒变", x, 420.0, 132.0, TEXT, 1.0, true, Align::Left);
-    text(st, &mut pm, "电脑手柄", x, 575.0, 132.0, TEXT, 1.0, true, Align::Left);
-    text(st, &mut pm, "Retroid Pocket Flip 2 · 刷 Linux", x, 670.0, 44.0, DIM, 1.0, true, Align::Left);
-    let mut cx = x;
-    for (i, c) in ["Wi-Fi 2ms", "触控板", "耳机 + 麦", "蓝牙", "开源"].iter().enumerate() {
-        let y = if i < 3 { 760.0 } else { 844.0 };
-        if i == 3 {
-            cx = x;
-        }
-        cx += chip(st, &mut pm, c, cx, y) + 16.0;
-    }
+    text(st, &mut pm, "掌机秒变", x, 470.0, 132.0, TEXT, 1.0, true, Align::Left);
+    text(st, &mut pm, "电脑手柄", x, 625.0, 132.0, TEXT, 1.0, true, Align::Left);
+    text(st, &mut pm, "Retroid Pocket Flip 2 · 刷 Linux", x, 725.0, 44.0, DIM, 1.0, true, Align::Left);
     text(st, &mut pm, "Flip Pad", x, 1010.0, 40.0, TEXT, 0.85, true, Align::Left);
     pm
 }
