@@ -96,7 +96,8 @@ impl App {
             gesture: None,
             drag_lock: false,
             touch: None,
-            orientation: if std::env::var_os("FLIPAD_TOUCH_NAME").is_some() { None } else { load_orientation() },
+            // learned afresh each run from the first touch, never trusted from disk
+            orientation: None,
             raw_prev: Vec::new(),
             raw_prev_at: Instant::now(),
             switcher: false,
@@ -238,9 +239,6 @@ impl App {
         if dist < 0.06 && self.orientation != Some(o) {
             eprintln!("touch: panel orientation {o:?}");
             self.orientation = Some(o);
-            if std::env::var_os("FLIPAD_TOUCH_NAME").is_none() {
-                save_orientation(o);
-            }
         }
     }
 
@@ -527,19 +525,6 @@ impl ApplicationHandler<()> for App {
             el.set_control_flow(ControlFlow::WaitUntil(next_frame));
         }
     }
-}
-
-fn orientation_file() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/flipad/touch-orientation")
-}
-
-fn load_orientation() -> Option<crate::touch::Orientation> {
-    let s = std::fs::read_to_string(orientation_file()).ok()?;
-    crate::touch::Orientation::ALL.into_iter().find(|o| format!("{o:?}") == s.trim())
-}
-
-fn save_orientation(o: crate::touch::Orientation) {
-    let _ = std::fs::write(orientation_file(), format!("{o:?}"));
 }
 
 fn debug_input() -> bool {

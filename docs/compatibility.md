@@ -63,7 +63,7 @@
 
 ## 已知限制
 
-- gamescope 把触摸转成单个模拟鼠标，没有多点信息，双指操作后还可能卡在“按下”状态。所以客户端直接读取触摸屏（`/dev/input` 中带 `INPUT_PROP_DIRECT` 的多点设备，deck 用户可读、未被独占）。第一次触摸时用模拟鼠标的位置校准屏幕方向，结果保存在 `~/.config/flipad/touch-orientation`。
+- gamescope 把触摸转成单个模拟鼠标，没有多点信息，双指操作后还可能卡在“按下”状态。所以客户端直接读取触摸屏（`/dev/input` 中带 `INPUT_PROP_DIRECT` 的多点设备，deck 用户可读、未被独占）。每次启动后，第一次触摸照常走模拟鼠标，同时用它的位置校准屏幕方向；之后每次点击都会复核。
 - Steam 默认让非 Steam 游戏以 1280×720 渲染再放大。部署工具会把 Flip Pad 的分辨率设成“原生”（`SetAppResolutionOverride(…, "Native")`）。
 
 - 蓝牙模式没有耳机麦克风：HFP 依赖内核的 RFCOMM，而 Pocknix 内核没有开启 `CONFIG_BT_RFCOMM`（BlueZ 报 `RFCOMM server failed for Hands-Free unit: Protocol not supported`）。需要麦克风请用 Wi-Fi 模式。如果你的系统内核支持 RFCOMM，在 WirePlumber 里开启 `hfp_hf` 角色即可；电脑在有程序录音时会自动切到 HFP。
