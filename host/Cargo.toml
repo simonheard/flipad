@@ -1,0 +1,9 @@
+[package]
+name = "flipad-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flipad-proto = { path = "../proto" }
+evdev = "0.13"
+libc = "0.2"

@@ -1,0 +1,4 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+# Fedora's cross gcc ships no libgcc_s; .cross-lib holds the handheld's copy.
+rustflags = ["-C", "link-arg=--sysroot=/usr/aarch64-redhat-linux/sys-root/fc44", "-L", ".cross-lib"]

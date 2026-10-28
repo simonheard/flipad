@@ -1,0 +1,11 @@
+[Unit]
+Description=flipad host: Retroid Flip 2 as a wireless controller
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/flipad-host
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
